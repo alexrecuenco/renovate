@@ -171,6 +171,40 @@ export async function processBranch(
         result: BranchResult.Pending,
       };
     }
+
+    // Check schedule
+    config.isScheduledNow = isScheduledNow(config, 'schedule');
+    if (!config.isScheduledNow && !dependencyDashboardCheck) {
+      if (!branchExists) {
+        logger.debug('Skipping branch creation as not within schedule');
+        return {
+          branchExists,
+          prNo: branchPr?.number,
+          result: BranchResult.NotScheduled,
+        };
+      }
+      if (config.updateNotScheduled === false && !config.rebaseRequested) {
+        logger.debug('Skipping branch update as not within schedule');
+        return {
+          branchExists,
+          prNo: branchPr?.number,
+          result: BranchResult.UpdateNotScheduled,
+        };
+      }
+      // istanbul ignore if
+      if (!branchPr) {
+        logger.debug('Skipping PR creation out of schedule');
+        return {
+          branchExists,
+          result: BranchResult.NotScheduled,
+        };
+      }
+      logger.debug(
+        'Branch + PR exists but is not scheduled -- will update if necessary'
+      );
+    }
+
+    await checkoutBranch(config.baseBranch!);
     if (branchExists) {
       logger.debug('Checking if PR has been edited');
       const branchIsModified = await isBranchModified(config.branchName);
@@ -247,38 +281,6 @@ export async function processBranch(
       }
     }
 
-    // Check schedule
-    config.isScheduledNow = isScheduledNow(config, 'schedule');
-    if (!config.isScheduledNow && !dependencyDashboardCheck) {
-      if (!branchExists) {
-        logger.debug('Skipping branch creation as not within schedule');
-        return {
-          branchExists,
-          prNo: branchPr?.number,
-          result: BranchResult.NotScheduled,
-        };
-      }
-      if (config.updateNotScheduled === false && !config.rebaseRequested) {
-        logger.debug('Skipping branch update as not within schedule');
-        return {
-          branchExists,
-          prNo: branchPr?.number,
-          result: BranchResult.UpdateNotScheduled,
-        };
-      }
-      // istanbul ignore if
-      if (!branchPr) {
-        logger.debug('Skipping PR creation out of schedule');
-        return {
-          branchExists,
-          result: BranchResult.NotScheduled,
-        };
-      }
-      logger.debug(
-        'Branch + PR exists but is not scheduled -- will update if necessary'
-      );
-    }
-    await checkoutBranch(config.baseBranch!);
     //stability checks
     if (
       config.upgrades.some(
