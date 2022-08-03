@@ -25,14 +25,15 @@ export async function rebaseOnboardingBranch(
     logger.debug('Onboarding branch has been edited and cannot be rebased');
     return null;
   }
+  // TODO #7154
+  if (!(await isBranchBehindBase(config.onboardingBranch!))) {
+    logger.debug('Onboarding branch is up to date');
+    return null;
+  }
   const configFile = defaultConfigFile(config);
   const existingContents = await getFile(configFile, config.onboardingBranch);
   const contents = await getOnboardingConfigContents(config, configFile);
-  // TODO #7154
-  if (
-    contents === existingContents &&
-    !(await isBranchBehindBase(config.onboardingBranch!))
-  ) {
+  if (contents === existingContents) {
     logger.debug('Onboarding branch is up to date');
     return null;
   }
