@@ -3,7 +3,6 @@ import {
   fs,
   git,
   mocked,
-  mockedFunction,
   partial,
   platform,
 } from '../../../../../test/util';
@@ -18,6 +17,7 @@ import * as _npmPostExtract from '../../../../modules/manager/npm/post-update';
 import type { WriteExistingFilesResult } from '../../../../modules/manager/npm/post-update/types';
 import { hashBody } from '../../../../modules/platform/pr-body';
 import { PrState } from '../../../../types';
+import * as _repoCache from '../../../../util/cache/repository';
 import * as _exec from '../../../../util/exec';
 import type { FileChange, StatusResult } from '../../../../util/git/types';
 import * as _mergeConfidence from '../../../../util/merge-confidence';
@@ -25,7 +25,6 @@ import * as _sanitize from '../../../../util/sanitize';
 import * as _limits from '../../../global/limits';
 import type { BranchConfig, BranchUpgradeConfig } from '../../../types';
 import { BranchResult } from '../../../types';
-import { needsChangelogs } from '../../changelog';
 import type { Pr } from '../../onboarding/branch/check';
 import * as _prWorker from '../pr';
 import type { ResultWithPr } from '../pr';
@@ -55,6 +54,7 @@ jest.mock('../../../../util/sanitize');
 jest.mock('../../../../util/fs');
 jest.mock('../../../../util/git');
 jest.mock('../../../global/limits');
+jest.mock('../../../../util/cache/repository');
 
 const getUpdated = mocked(_getUpdated);
 const schedule = mocked(_schedule);
@@ -69,6 +69,7 @@ const prWorker = mocked(_prWorker);
 const exec = mocked(_exec);
 const sanitize = mocked(_sanitize);
 const limits = mocked(_limits);
+const repoCache = mocked(_repoCache);
 
 const adminConfig: RepoGlobalConfig = { localDir: '', cacheDir: '' };
 
@@ -84,13 +85,14 @@ function findFileContent(
 }
 
 describe('workers/repository/update/branch/index', () => {
+  let config: BranchConfig;
+
   describe('processBranch', () => {
     const updatedPackageFiles: PackageFilesResult = {
       updatedPackageFiles: [],
       artifactErrors: [],
       updatedArtifacts: [],
     };
-    let config: BranchConfig;
 
     beforeEach(() => {
       git.branchExists.mockReturnValue(false);
@@ -118,6 +120,7 @@ describe('workers/repository/update/branch/index', () => {
       });
       GlobalConfig.set(adminConfig);
       sanitize.sanitize.mockImplementation((input) => input);
+      repoCache.getCache.mockReturnValue({});
     });
 
     afterEach(() => {
@@ -128,269 +131,1401 @@ describe('workers/repository/update/branch/index', () => {
       GlobalConfig.reset();
     });
 
-    it('skips branch if not scheduled and branch does not exist', async () => {
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      const res = await branchWorker.processBranch(config);
-      expect(res).toEqual({
-        branchExists: false,
-        prNo: undefined,
-        result: 'not-scheduled',
+    describe('schedule related()', () => {
+      it('skips branch if not scheduled and branch does not exist', async () => {
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        const res = await branchWorker.processBranch(config);
+        expect(res).toEqual({
+          branchExists: false,
+          prNo: undefined,
+          result: 'not-scheduled',
+        });
+      });
+
+      it('skips branch if not scheduled and not updating out of schedule', async () => {
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        config.updateNotScheduled = false;
+        git.branchExists.mockReturnValue(true);
+        const res = await branchWorker.processBranch(config);
+        expect(res).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'update-not-scheduled',
+        });
+      });
+
+      it('processes branch if not scheduled but updating out of schedule', async () => {
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        config.updateNotScheduled = true;
+        git.branchExists.mockReturnValue(true);
+        platform.getBranchPr.mockResolvedValueOnce({
+          state: PrState.Open,
+        } as Pr);
+        git.isBranchModified.mockResolvedValueOnce(false);
+        await branchWorker.processBranch(config);
+        expect(reuse.shouldReuseExistingBranch).toHaveBeenCalled();
       });
     });
 
-    it('skips branch if not scheduled and not updating out of schedule', async () => {
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      config.updateNotScheduled = false;
-      git.branchExists.mockReturnValue(true);
-      const res = await branchWorker.processBranch(config);
-      expect(res).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'update-not-scheduled',
+    describe('stability related()', () => {
+      it('skips branch for fresh release with stabilityDays', async () => {
+        schedule.isScheduledNow.mockReturnValueOnce(true);
+        config.prCreation = 'not-pending';
+        (config.upgrades as Partial<BranchUpgradeConfig>[]) = [
+          {
+            releaseTimestamp: new Date('2019-01-01').getTime().toString(),
+            stabilityDays: 1,
+          },
+          {
+            releaseTimestamp: new Date().toString(),
+            stabilityDays: 1,
+          },
+        ];
+
+        git.branchExists.mockReturnValue(false);
+        const res = await branchWorker.processBranch(config);
+        expect(res).toEqual({
+          branchExists: false,
+          prNo: undefined,
+          result: 'pending',
+        });
+      });
+
+      it('skips branch if not stabilityDays not met', async () => {
+        schedule.isScheduledNow.mockReturnValueOnce(true);
+        config.prCreation = 'not-pending';
+        (config.upgrades as Partial<BranchUpgradeConfig>[]) = [
+          {
+            releaseTimestamp: '2099-12-31',
+            stabilityDays: 1,
+          },
+        ];
+        const res = await branchWorker.processBranch(config);
+        expect(res).toEqual({
+          branchExists: false,
+          prNo: undefined,
+          result: 'pending',
+        });
+      });
+
+      it('processes branch if minimumConfidence not met', async () => {
+        schedule.isScheduledNow.mockReturnValueOnce(true);
+        config.prCreation = 'not-pending';
+        (config.upgrades as Partial<BranchUpgradeConfig>[]) = [
+          {
+            minimumConfidence: 'high',
+          },
+        ];
+        mergeConfidence.isActiveConfidenceLevel.mockReturnValue(true);
+        mergeConfidence.satisfiesConfidenceLevel.mockReturnValueOnce(false);
+        const res = await branchWorker.processBranch(config);
+        expect(logger.debug).toHaveBeenCalledWith(
+          {
+            confidence: undefined,
+            depName: undefined,
+            minimumConfidence: 'high',
+          },
+          'Update does not meet minimum confidence scores'
+        );
+        expect(res).toEqual({
+          branchExists: false,
+          prNo: undefined,
+          result: 'error',
+        });
+      });
+
+      it('processes branch if minimumConfidence is met', async () => {
+        schedule.isScheduledNow.mockReturnValueOnce(true);
+        config.prCreation = 'not-pending';
+        (config.upgrades as Partial<BranchUpgradeConfig>[]) = [
+          {
+            minimumConfidence: 'high',
+          },
+        ];
+        mergeConfidence.isActiveConfidenceLevel.mockReturnValue(true);
+        mergeConfidence.satisfiesConfidenceLevel.mockReturnValueOnce(true);
+        const res = await branchWorker.processBranch(config);
+        expect(logger.debug).not.toHaveBeenCalledWith(
+          {
+            confidence: undefined,
+            depName: undefined,
+            minimumConfidence: 'high',
+          },
+          'Update does not meet minimum confidence scores'
+        );
+        expect(res).toEqual({
+          branchExists: false,
+          prNo: undefined,
+          result: 'error',
+        });
       });
     });
 
-    it('skips branch for fresh release with stabilityDays', async () => {
-      schedule.isScheduledNow.mockReturnValueOnce(true);
-      config.prCreation = 'not-pending';
-      (config.upgrades as Partial<BranchUpgradeConfig>[]) = [
-        {
-          releaseTimestamp: new Date('2019-01-01').getTime().toString(),
-          stabilityDays: 1,
-        },
-        {
-          releaseTimestamp: new Date().toString(),
-          stabilityDays: 1,
-        },
-      ];
+    describe('merged or closed pr', () => {
+      it('skips branch if closed major PR found', async () => {
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        git.branchExists.mockReturnValue(true);
+        config.updateType = 'major';
+        checkExisting.prAlreadyExisted.mockResolvedValueOnce({
+          number: 13,
+          state: PrState.Closed,
+        } as Pr);
+        await branchWorker.processBranch(config);
+        expect(reuse.shouldReuseExistingBranch).toHaveBeenCalledTimes(0);
+      });
 
+      it('skips branch if closed digest PR found', async () => {
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        git.branchExists.mockReturnValue(true);
+        config.updateType = 'digest';
+        checkExisting.prAlreadyExisted.mockResolvedValueOnce({
+          number: 13,
+          state: PrState.Closed,
+        } as Pr);
+        await branchWorker.processBranch(config);
+        expect(reuse.shouldReuseExistingBranch).toHaveBeenCalledTimes(0);
+      });
+
+      it('skips branch if closed minor PR found', async () => {
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        git.branchExists.mockReturnValue(true);
+        checkExisting.prAlreadyExisted.mockResolvedValueOnce({
+          number: 13,
+          state: PrState.Closed,
+        } as Pr);
+        await branchWorker.processBranch(config);
+        expect(reuse.shouldReuseExistingBranch).toHaveBeenCalledTimes(0);
+      });
+
+      it('skips branch if merged PR found', async () => {
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        git.branchExists.mockReturnValue(true);
+        checkExisting.prAlreadyExisted.mockResolvedValueOnce({
+          number: 13,
+          state: PrState.Merged,
+        } as Pr);
+        await branchWorker.processBranch(config);
+        expect(reuse.shouldReuseExistingBranch).toHaveBeenCalledTimes(0);
+      });
+
+      it('throws error if closed PR found', async () => {
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        git.branchExists.mockReturnValue(true);
+        platform.getBranchPr.mockResolvedValueOnce({
+          state: PrState.Merged,
+        } as Pr);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        await expect(branchWorker.processBranch(config)).rejects.toThrow(
+          REPOSITORY_CHANGED
+        );
+      });
+
+      it('closed pr (dry run)', async () => {
+        git.branchExists.mockReturnValue(true);
+        checkExisting.prAlreadyExisted.mockResolvedValueOnce({
+          state: PrState.Closed,
+        } as Pr);
+        GlobalConfig.set({ ...adminConfig, dryRun: 'full' });
+        expect(await branchWorker.processBranch(config)).toEqual({
+          branchExists: false,
+          prNo: undefined,
+          result: 'already-existed',
+        });
+      });
+    });
+
+    describe('modified branch or edited pr', () => {
+      it('does not skip branch if edited PR found with rebaseLabel', async () => {
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        git.branchExists.mockReturnValue(true);
+        platform.getBranchPr.mockResolvedValueOnce({
+          state: PrState.Open,
+          labels: ['rebase'],
+        } as Pr);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        const res = await branchWorker.processBranch(config);
+        expect(res).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'error',
+        });
+      });
+
+      it('skips branch if edited PR found', async () => {
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        jest.spyOn(prWorker, 'updatePrDebugData').mockReturnValueOnce({
+          updatedInVer: '1.0.3',
+          createdInVer: '1.0.2',
+        });
+        git.branchExists.mockReturnValue(true);
+        platform.getBranchPr.mockResolvedValueOnce({
+          state: PrState.Open,
+          body: '**Rebasing**: something',
+        } as Pr);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        const res = await branchWorker.processBranch(config);
+        expect(res).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'pr-edited',
+        });
+      });
+
+      it('skips branch if target branch changed', async () => {
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        jest.spyOn(prWorker, 'updatePrDebugData').mockReturnValueOnce({
+          updatedInVer: '1.0.3',
+          createdInVer: '1.0.2',
+        });
+        git.branchExists.mockReturnValue(true);
+        platform.getBranchPr.mockResolvedValueOnce({
+          state: PrState.Open,
+          targetBranch: 'v6',
+        } as Pr);
+        git.isBranchModified.mockResolvedValueOnce(false);
+        config.baseBranch = 'master';
+        const res = await branchWorker.processBranch(config);
+        expect(res).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'pr-edited',
+        });
+      });
+
+      it('skips branch if branch edited and no PR found', async () => {
+        git.branchExists.mockReturnValue(true);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        const res = await branchWorker.processBranch(config);
+        expect(res).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'pr-edited',
+        });
+      });
+
+      it('continues branch if branch edited and but PR found', async () => {
+        git.branchExists.mockReturnValue(true);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        git.getBranchCommit.mockReturnValue('123test');
+        platform.findPr.mockResolvedValueOnce({ sha: '123test' } as any);
+        const res = await branchWorker.processBranch(config);
+        expect(res).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'error',
+        });
+      });
+
+      it('skips branch if branch edited and and PR found with sha mismatch', async () => {
+        git.branchExists.mockReturnValue(true);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        git.getBranchCommit.mockReturnValueOnce('123test');
+        platform.findPr.mockResolvedValueOnce({ sha: 'def456' } as any);
+        const res = await branchWorker.processBranch(config);
+        expect(res).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'pr-edited',
+        });
+      });
+    });
+
+    describe('branch or pr limit related()', () => {
+      it('returns if branch creation limit exceeded', async () => {
+        limits.isLimitReached.mockReturnValueOnce(true);
+        limits.isLimitReached.mockReturnValueOnce(false);
+        expect(await branchWorker.processBranch(config)).toEqual({
+          branchExists: false,
+          prNo: undefined,
+          result: 'branch-limit-reached',
+        });
+      });
+
+      it('returns if pr creation limit exceeded and branch exists', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          ...updatedPackageFiles,
+        });
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [],
+        });
+        git.branchExists.mockReturnValue(true);
+        prWorker.ensurePr.mockResolvedValueOnce({
+          type: 'without-pr',
+          prBlockedBy: 'RateLimited',
+        });
+        limits.isLimitReached.mockReturnValue(false);
+        expect(await branchWorker.processBranch(config)).toEqual({
+          branchExists: true,
+          prBlockedBy: 'RateLimited',
+          result: 'pr-limit-reached',
+        });
+      });
+
+      it('returns if commit limit exceeded', async () => {
+        git.branchExists.mockReturnValue(false);
+        limits.isLimitReached.mockReturnValueOnce(false);
+        limits.isLimitReached.mockReturnValueOnce(true);
+        expect(await branchWorker.processBranch(config)).toEqual({
+          branchExists: false,
+          prNo: undefined,
+          result: 'commit-limit-reached',
+        });
+      });
+    });
+
+    describe('automerge related', () => {
+      it('returns if branch automerged', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [{}],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [partial<FileChange>({})],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+        automerge.tryBranchAutomerge.mockResolvedValueOnce('automerged');
+        await branchWorker.processBranch(config);
+        expect(automerge.tryBranchAutomerge).toHaveBeenCalledTimes(1);
+        expect(prWorker.ensurePr).toHaveBeenCalledTimes(0);
+      });
+
+      it('returns if branch automerged and no checks', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [{}],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [partial<FileChange>({})],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(false);
+        automerge.tryBranchAutomerge.mockResolvedValueOnce('automerged');
+        await branchWorker.processBranch({
+          ...config,
+          ignoreTests: true,
+        });
+        expect(automerge.tryBranchAutomerge).toHaveBeenCalledTimes(1);
+        expect(prWorker.ensurePr).toHaveBeenCalledTimes(0);
+      });
+
+      it('returns if branch automerged (dry-run)', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [{}],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [partial<FileChange>({})],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+        automerge.tryBranchAutomerge.mockResolvedValueOnce('automerged');
+        GlobalConfig.set({ ...adminConfig, dryRun: 'full' });
+        await branchWorker.processBranch(config);
+        expect(automerge.tryBranchAutomerge).toHaveBeenCalledTimes(1);
+        expect(prWorker.ensurePr).toHaveBeenCalledTimes(0);
+        expect(git.deleteBranch).toHaveBeenCalledTimes(0);
+      });
+
+      it('skips when automerge is off schedule', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce(
+          partial<PackageFilesResult>({})
+        );
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce(
+          partial<WriteExistingFilesResult>({
+            artifactErrors: [],
+            updatedArtifacts: [],
+          })
+        );
+        git.branchExists.mockReturnValue(true);
+        automerge.tryBranchAutomerge.mockResolvedValueOnce('off schedule');
+        prWorker.ensurePr.mockResolvedValueOnce(
+          partial<ResultWithPr>({ type: 'with-pr' })
+        );
+        prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: false });
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+        const inconfig = {
+          ...config,
+          automerge: true,
+          rebaseWhen: 'conflicted',
+        };
+        await expect(branchWorker.processBranch(inconfig)).resolves.toEqual({
+          branchExists: true,
+          result: BranchResult.NotScheduled,
+        });
+        expect(logger.debug).toHaveBeenCalledWith(
+          'Branch cannot automerge now because automergeSchedule is off schedule - skipping'
+        );
+        expect(prWorker.ensurePr).toHaveBeenCalledTimes(0);
+        expect(platform.ensureCommentRemoval).toHaveBeenCalledTimes(0);
+        expect(prAutomerge.checkAutoMerge).toHaveBeenCalledTimes(0);
+      });
+    });
+
+    describe('ensurePR related', () => {
+      it('ensures PR and tries automerge', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [{}],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [partial<FileChange>({})],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        automerge.tryBranchAutomerge.mockResolvedValueOnce('failed');
+        prWorker.ensurePr.mockResolvedValueOnce({
+          type: 'with-pr',
+          pr: {},
+        } as ResultWithPr);
+        prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: true });
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+        await branchWorker.processBranch({ ...config, automerge: true });
+        expect(prWorker.ensurePr).toHaveBeenCalledTimes(1);
+        expect(platform.ensureCommentRemoval).toHaveBeenCalledTimes(0);
+        expect(prAutomerge.checkAutoMerge).toHaveBeenCalledTimes(1);
+      });
+
+      it('ensures PR when impossible to automerge', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [{}],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [partial<FileChange>({})],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        automerge.tryBranchAutomerge.mockResolvedValueOnce('stale');
+        prWorker.ensurePr.mockResolvedValueOnce({
+          type: 'with-pr',
+          pr: {},
+        } as ResultWithPr);
+        prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: false });
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+        await branchWorker.processBranch({
+          ...config,
+          automerge: true,
+          rebaseWhen: 'conflicted',
+        });
+        expect(prWorker.ensurePr).toHaveBeenCalledTimes(1);
+        expect(platform.ensureCommentRemoval).toHaveBeenCalledTimes(0);
+        expect(prAutomerge.checkAutoMerge).toHaveBeenCalledTimes(1);
+      });
+
+      it('ensures PR and adds lock file error comment if no releaseTimestamp', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [{}],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [{}],
+          updatedArtifacts: [{}],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        automerge.tryBranchAutomerge.mockResolvedValueOnce('failed');
+        prWorker.ensurePr.mockResolvedValueOnce({
+          type: 'with-pr',
+          pr: {},
+        } as ResultWithPr);
+        prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: true });
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+        await branchWorker.processBranch(config);
+        expect(platform.ensureComment).toHaveBeenCalledTimes(1);
+        expect(prWorker.ensurePr).toHaveBeenCalledTimes(1);
+        expect(prAutomerge.checkAutoMerge).toHaveBeenCalledTimes(0);
+      });
+
+      it('ensures PR and adds lock file error comment if old releaseTimestamp', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [{}],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [{}],
+          updatedArtifacts: [{}],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        automerge.tryBranchAutomerge.mockResolvedValueOnce('failed');
+        prWorker.ensurePr.mockResolvedValueOnce({
+          type: 'with-pr',
+          pr: {},
+        } as ResultWithPr);
+        prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: true });
+        config.releaseTimestamp = '2018-04-26T05:15:51.877Z';
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+        await branchWorker.processBranch(config);
+        expect(platform.ensureComment).toHaveBeenCalledTimes(1);
+        expect(prWorker.ensurePr).toHaveBeenCalledTimes(1);
+        expect(prAutomerge.checkAutoMerge).toHaveBeenCalledTimes(0);
+      });
+
+      it('ensures PR and adds lock file error comment if new releaseTimestamp and branch exists', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [{}],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [{}],
+          updatedArtifacts: [{}],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        automerge.tryBranchAutomerge.mockResolvedValueOnce('failed');
+        prWorker.ensurePr.mockResolvedValueOnce({
+          type: 'with-pr',
+          pr: {},
+        } as ResultWithPr);
+        prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: true });
+        config.releaseTimestamp = new Date().toISOString();
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+        await branchWorker.processBranch(config);
+        expect(platform.ensureComment).toHaveBeenCalledTimes(1);
+        expect(prWorker.ensurePr).toHaveBeenCalledTimes(1);
+        expect(prAutomerge.checkAutoMerge).toHaveBeenCalledTimes(0);
+      });
+
+      it('ensures PR and adds lock file error comment recreate closed', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [{}],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [{}],
+          updatedArtifacts: [{}],
+        } as WriteExistingFilesResult);
+        config.recreateClosed = true;
+        git.branchExists.mockReturnValue(true);
+        automerge.tryBranchAutomerge.mockResolvedValueOnce('failed');
+        prWorker.ensurePr.mockResolvedValueOnce({
+          type: 'with-pr',
+          pr: {},
+        } as ResultWithPr);
+        prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: true });
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+        await branchWorker.processBranch(config);
+        expect(platform.ensureComment).toHaveBeenCalledTimes(1);
+        expect(prWorker.ensurePr).toHaveBeenCalledTimes(1);
+        expect(prAutomerge.checkAutoMerge).toHaveBeenCalledTimes(0);
+      });
+    });
+
+    describe('swallows erros', () => {
+      it('swallows branch errors', async () => {
+        getUpdated.getUpdatedPackageFiles.mockImplementationOnce(() => {
+          throw new Error('some error');
+        });
+        const processBranchResult = await branchWorker.processBranch(config);
+        expect(processBranchResult).toEqual({
+          branchExists: false,
+          prNo: undefined,
+          result: 'error',
+        });
+      });
+
+      it('throws and swallows branch errors', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [{}],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [{}],
+          updatedArtifacts: [{}],
+        } as WriteExistingFilesResult);
+        const processBranchResult = await branchWorker.processBranch(config);
+        expect(processBranchResult).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'pr-created',
+        });
+      });
+
+      it('swallows pr errors', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [{}],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [partial<FileChange>({})],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        automerge.tryBranchAutomerge.mockResolvedValueOnce('failed');
+        prWorker.ensurePr.mockImplementationOnce(() => {
+          throw new Error('some error');
+        });
+        const processBranchResult = await branchWorker.processBranch(config);
+        expect(processBranchResult).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'done',
+        });
+      });
+    });
+
+    describe('open pr', () => {
+      it('branch pr no rebase (dry run)', async () => {
+        git.branchExists.mockReturnValue(true);
+        jest.spyOn(prWorker, 'updatePrDebugData').mockReturnValueOnce({
+          updatedInVer: '1.0.3',
+          createdInVer: '1.0.2',
+        });
+        platform.getBranchPr.mockResolvedValueOnce({
+          state: PrState.Open,
+        } as Pr);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        GlobalConfig.set({ ...adminConfig, dryRun: 'full' });
+        expect(await branchWorker.processBranch(config)).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'pr-edited',
+        });
+      });
+
+      it('branch pr no schedule lockfile (dry run)', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [{}],
+          artifactErrors: [{}],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [partial<FileChange>({})],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        platform.getBranchPr.mockResolvedValueOnce({
+          title: 'rebase!',
+          state: PrState.Open,
+          bodyStruct: {
+            hash: hashBody(`- [x] <!-- rebase-check -->`),
+            rebaseRequested: true,
+          },
+        } as Pr);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+        GlobalConfig.set({ ...adminConfig, dryRun: 'full' });
+        const inconfig = {
+          ...config,
+          updateType: 'lockFileMaintenance',
+          reuseExistingBranch: false,
+          updatedArtifacts: [{ type: 'deletion', path: 'dummy' }],
+        } as BranchConfig;
+        expect(await branchWorker.processBranch(inconfig)).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'done',
+        });
+      });
+
+      it('branch pr no schedule (dry run)', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [{}],
+          artifactErrors: [{}],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [partial<FileChange>({})],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        platform.getBranchPr.mockResolvedValueOnce({
+          title: 'rebase!',
+          state: PrState.Open,
+          bodyStruct: {
+            hash: hashBody(`- [x] <!-- rebase-check -->`),
+            rebaseRequested: true,
+          },
+        } as Pr);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        prWorker.ensurePr.mockResolvedValueOnce({
+          type: 'with-pr',
+          pr: {},
+        } as ResultWithPr);
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+        GlobalConfig.set({ ...adminConfig, dryRun: 'full' });
+        // TODO: some error
+        const inconfig = {
+          ...config,
+          artifactErrors: [{}],
+        } as BranchConfig;
+        expect(await branchWorker.processBranch(inconfig)).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'done',
+        });
+      });
+
+      it('branch pr no schedule', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce(
+          partial<PackageFilesResult>({
+            updatedPackageFiles: [partial<FileChange>({})],
+            artifactErrors: [],
+            updatedArtifacts: [],
+          })
+        );
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [partial<FileChange>({})],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        platform.getBranchPr.mockResolvedValueOnce({
+          title: 'rebase!',
+          state: PrState.Open,
+          bodyStruct: {
+            hash: hashBody(`- [x] <!-- rebase-check -->`),
+            rebaseRequested: true,
+          },
+        } as Pr);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+        const inconfig = {
+          ...config,
+          updateType: 'lockFileMaintenance',
+          reuseExistingBranch: false,
+          updatedArtifacts: [{ type: 'deletion', path: 'dummy' }],
+        } as BranchConfig;
+        expect(await branchWorker.processBranch(inconfig)).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'done',
+        });
+      });
+    });
+
+    describe('stopUpdatingLabel', () => {
+      it('skips branch update if stopUpdatingLabel presents', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce(
+          partial<PackageFilesResult>({
+            updatedPackageFiles: [partial<FileChange>({})],
+            artifactErrors: [],
+            updatedArtifacts: [],
+          })
+        );
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [partial<FileChange>({})],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        platform.getBranchPr.mockResolvedValueOnce({
+          title: 'rebase!',
+          state: PrState.Open,
+          labels: ['stop-updating'],
+          bodyStruct: { hash: hashBody(`- [ ] <!-- rebase-check -->`) },
+        } as Pr);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+        const inconfig = {
+          ...config,
+          dependencyDashboardChecks: { 'renovate/some-branch': 'true' },
+          updatedArtifacts: [{ type: 'deletion', path: 'dummy' }],
+        } as BranchConfig;
+        expect(await branchWorker.processBranch(inconfig)).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'no-work',
+        });
+        expect(commit.commitFilesToBranch).not.toHaveBeenCalled();
+      });
+
+      it('updates branch if stopUpdatingLabel presents and PR rebase/retry box checked', async () => {
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce(
+          partial<PackageFilesResult>({
+            updatedPackageFiles: [partial<FileChange>({})],
+            artifactErrors: [],
+            updatedArtifacts: [],
+          })
+        );
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [partial<FileChange>({})],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        platform.getBranchPr.mockResolvedValueOnce({
+          title: 'Update dependency',
+          state: PrState.Open,
+          labels: ['stop-updating'],
+          bodyStruct: {
+            hash: hashBody(`- [x] <!-- rebase-check -->`),
+            rebaseRequested: true,
+          },
+        } as Pr);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+        const inconfig = {
+          ...config,
+          reuseExistingBranch: false,
+          updatedArtifacts: [{ type: 'deletion', path: 'dummy' }],
+        } as BranchConfig;
+        expect(await branchWorker.processBranch(inconfig)).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'done',
+        });
+        expect(commit.commitFilesToBranch).toHaveBeenCalled();
+      });
+    });
+
+    describe('postUpgradeTasks', () => {
+      it('executes post-upgrade tasks if trust is high', async () => {
+        const updatedPackageFile: FileChange = {
+          type: 'addition',
+          path: 'pom.xml',
+          contents: 'pom.xml file contents',
+        };
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [updatedPackageFile],
+          artifactErrors: [],
+          updatedArtifacts: [],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [
+            {
+              type: 'addition',
+              path: 'yarn.lock',
+              contents: Buffer.from([1, 2, 3]) /* Binary content */,
+            },
+          ],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        platform.getBranchPr.mockResolvedValueOnce({
+          title: 'rebase!',
+          state: PrState.Open,
+          bodyStruct: {
+            hash: hashBody(`- [x] <!-- rebase-check -->`),
+            rebaseRequested: true,
+          },
+        } as Pr);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        git.getRepoStatus.mockResolvedValueOnce(
+          partial<StatusResult>({
+            modified: ['modified_file'],
+            not_added: [],
+            deleted: ['deleted_file'],
+          })
+        );
+        fs.readLocalFile.mockResolvedValueOnce('modified file content');
+        fs.localPathExists
+          .mockResolvedValueOnce(true)
+          .mockResolvedValueOnce(true);
+        fs.localPathIsFile
+          .mockResolvedValueOnce(true)
+          .mockResolvedValueOnce(true);
+
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+
+        GlobalConfig.set({
+          ...adminConfig,
+          allowedPostUpgradeCommands: ['^echo {{{versioning}}}$'],
+          allowPostUpgradeCommandTemplating: true,
+          exposeAllEnv: true,
+          localDir: '/localDir',
+        });
+        const inconfig = {
+          ...config,
+          postUpgradeTasks: {
+            executionMode: 'update',
+            commands: ['echo {{{versioning}}}', 'disallowed task'],
+            fileFilters: ['modified_file', 'deleted_file'],
+          },
+          upgrades: [
+            {
+              ...defaultConfig,
+              depName: 'some-dep-name',
+              postUpgradeTasks: {
+                executionMode: 'update',
+                commands: ['echo {{{versioning}}}', 'disallowed task'],
+                fileFilters: ['modified_file', 'deleted_file'],
+              },
+            } as BranchUpgradeConfig,
+          ],
+        } as BranchConfig;
+        const result = await branchWorker.processBranch(inconfig);
+        expect(result).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'done',
+        });
+        const errorMessage = expect.stringContaining(
+          "Post-upgrade command 'disallowed task' has not been added to the allowed list in allowedPostUpgradeCommand"
+        );
+        expect(platform.ensureComment).toHaveBeenCalledWith(
+          expect.objectContaining({
+            content: errorMessage,
+          })
+        );
+        expect(sanitize.sanitize).toHaveBeenCalledWith(errorMessage);
+      });
+
+      it('handles post-upgrade task exec errors', async () => {
+        const updatedPackageFile: FileChange = {
+          type: 'addition',
+          path: 'pom.xml',
+          contents: 'pom.xml file contents',
+        };
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [updatedPackageFile],
+          artifactErrors: [],
+        } as never);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [
+            {
+              name: 'yarn.lock',
+              contents: Buffer.from([1, 2, 3]) /* Binary content */,
+            },
+          ],
+        } as never);
+        git.branchExists.mockReturnValue(true);
+        platform.getBranchPr.mockResolvedValueOnce({
+          title: 'rebase!',
+          state: PrState.Open,
+          bodyStruct: {
+            hash: hashBody(`- [x] <!-- rebase-check -->`),
+            rebaseRequested: true,
+          },
+        } as never);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        git.getRepoStatus.mockResolvedValueOnce(
+          partial<StatusResult>({
+            modified: ['modified_file'],
+            not_added: [],
+            deleted: ['deleted_file'],
+          })
+        );
+
+        fs.readLocalFile.mockResolvedValueOnce('modified file content');
+        fs.localPathExists
+          .mockResolvedValueOnce(true)
+          .mockResolvedValueOnce(true);
+        fs.localPathIsFile
+          .mockResolvedValueOnce(true)
+          .mockResolvedValueOnce(true);
+
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+
+        GlobalConfig.set({
+          ...adminConfig,
+          allowedPostUpgradeCommands: ['^exit 1$'],
+          allowPostUpgradeCommandTemplating: true,
+          exposeAllEnv: true,
+          localDir: '/localDir',
+        });
+
+        exec.exec.mockRejectedValue(new Error('Meh, this went wrong!'));
+
+        await branchWorker.processBranch({
+          ...config,
+          upgrades: [
+            {
+              ...defaultConfig,
+              depName: 'some-dep-name',
+              postUpgradeTasks: {
+                commands: ['exit 1'],
+                fileFilters: ['modified_file', 'deleted_file'],
+              },
+            } as never,
+          ],
+        });
+
+        const errorMessage = expect.stringContaining('Meh, this went wrong!');
+        expect(platform.ensureComment).toHaveBeenCalledWith(
+          expect.objectContaining({
+            content: errorMessage,
+          })
+        );
+        expect(sanitize.sanitize).toHaveBeenCalledWith(errorMessage);
+      });
+
+      it('executes post-upgrade tasks with disabled post-upgrade command templating', async () => {
+        const updatedPackageFile: FileChange = {
+          type: 'addition',
+          path: 'pom.xml',
+          contents: 'pom.xml file contents',
+        };
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [updatedPackageFile],
+          artifactErrors: [],
+          updatedArtifacts: [],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [
+            {
+              type: 'addition',
+              path: 'yarn.lock',
+              contents: Buffer.from([1, 2, 3]) /* Binary content */,
+            },
+          ],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        platform.getBranchPr.mockResolvedValueOnce({
+          title: 'rebase!',
+          state: PrState.Open,
+          bodyStruct: {
+            hash: hashBody(`- [x] <!-- rebase-check -->`),
+            rebaseRequested: true,
+          },
+        } as Pr);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        git.getRepoStatus.mockResolvedValueOnce(
+          partial<StatusResult>({
+            modified: ['modified_file'],
+            not_added: [],
+            deleted: ['deleted_file'],
+          })
+        );
+
+        fs.readLocalFile.mockResolvedValueOnce('modified file content');
+        fs.localPathExists
+          .mockResolvedValueOnce(true)
+          .mockResolvedValueOnce(true);
+        fs.localPathIsFile
+          .mockResolvedValueOnce(true)
+          .mockResolvedValueOnce(true);
+
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+        GlobalConfig.set({
+          ...adminConfig,
+          allowedPostUpgradeCommands: ['^echo {{{versioning}}}$'],
+          allowPostUpgradeCommandTemplating: false,
+          exposeAllEnv: true,
+          localDir: '/localDir',
+        });
+        const inconfig = {
+          ...config,
+          postUpgradeTasks: {
+            executionMode: 'update',
+            commands: ['echo {{{versioning}}}', 'disallowed task'],
+            fileFilters: ['modified_file', 'deleted_file'],
+          },
+          upgrades: [
+            {
+              ...defaultConfig,
+              depName: 'some-dep-name',
+              postUpgradeTasks: {
+                executionMode: 'update',
+                commands: ['echo {{{versioning}}}', 'disallowed task'],
+                fileFilters: ['modified_file', 'deleted_file'],
+              },
+            } as BranchUpgradeConfig,
+          ],
+        } as BranchConfig;
+        const result = await branchWorker.processBranch(inconfig);
+        expect(result).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'done',
+        });
+        expect(exec.exec).toHaveBeenCalledWith('echo {{{versioning}}}', {
+          cwd: '/localDir',
+        });
+      });
+
+      it('executes post-upgrade tasks with multiple dependecy in one branch', async () => {
+        const updatedPackageFile: FileChange = {
+          type: 'addition',
+          path: 'pom.xml',
+          contents: 'pom.xml file contents',
+        };
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [updatedPackageFile],
+          artifactErrors: [],
+          updatedArtifacts: [],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [
+            {
+              type: 'addition',
+              path: 'yarn.lock',
+              contents: Buffer.from([1, 2, 3]) /* Binary content */,
+            },
+          ],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        platform.getBranchPr.mockResolvedValueOnce({
+          title: 'rebase!',
+          state: PrState.Open,
+          bodyStruct: {
+            hash: hashBody(`- [x] <!-- rebase-check -->`),
+            rebaseRequested: true,
+          },
+        } as Pr);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        git.getRepoStatus
+          .mockResolvedValueOnce(
+            partial<StatusResult>({
+              modified: ['modified_file', 'modified_then_deleted_file'],
+              not_added: [],
+              deleted: ['deleted_file', 'deleted_then_created_file'],
+            })
+          )
+          .mockResolvedValueOnce(
+            partial<StatusResult>({
+              modified: ['modified_file', 'deleted_then_created_file'],
+              not_added: [],
+              deleted: ['deleted_file', 'modified_then_deleted_file'],
+            })
+          );
+
+        fs.readLocalFile
+          .mockResolvedValueOnce('modified file content' as never)
+          .mockResolvedValueOnce('this file will not exists' as never)
+          .mockResolvedValueOnce('modified file content again' as never)
+          .mockResolvedValueOnce('this file was once deleted' as never);
+        fs.localPathExists.mockResolvedValue(true).mockResolvedValueOnce(true);
+        fs.localPathIsFile
+          .mockResolvedValueOnce(true)
+          .mockResolvedValueOnce(true);
+
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+
+        GlobalConfig.set({
+          ...adminConfig,
+          allowedPostUpgradeCommands: ['^echo {{{depName}}}$'],
+          allowPostUpgradeCommandTemplating: true,
+          exposeAllEnv: true,
+          localDir: '/localDir',
+        });
+
+        const inconfig: BranchConfig = {
+          ...config,
+          postUpgradeTasks: {
+            executionMode: 'update',
+            commands: ['echo {{{depName}}}', 'disallowed task'],
+            fileFilters: [
+              'modified_file',
+              'deleted_file',
+              'deleted_then_created_file',
+              'modified_then_deleted_file',
+            ],
+          },
+          upgrades: [
+            {
+              ...defaultConfig,
+              depName: 'some-dep-name-1',
+              postUpgradeTasks: {
+                executionMode: 'update',
+                commands: ['echo {{{depName}}}', 'disallowed task'],
+                fileFilters: [
+                  'modified_file',
+                  'deleted_file',
+                  'deleted_then_created_file',
+                  'modified_then_deleted_file',
+                ],
+              },
+            } as BranchUpgradeConfig,
+            {
+              ...defaultConfig,
+              depName: 'some-dep-name-2',
+              postUpgradeTasks: {
+                executionMode: 'update',
+                commands: ['echo {{{depName}}}', 'disallowed task'],
+                fileFilters: [
+                  'modified_file',
+                  'deleted_file',
+                  'deleted_then_created_file',
+                  'modified_then_deleted_file',
+                ],
+              },
+            } as BranchUpgradeConfig,
+          ],
+        };
+
+        const result = await branchWorker.processBranch(inconfig);
+
+        expect(result).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'done',
+        });
+        expect(exec.exec).toHaveBeenNthCalledWith(1, 'echo some-dep-name-1', {
+          cwd: '/localDir',
+        });
+        expect(exec.exec).toHaveBeenNthCalledWith(2, 'echo some-dep-name-2', {
+          cwd: '/localDir',
+        });
+        expect(exec.exec).toHaveBeenCalledTimes(2);
+        const calledWithConfig = commit.commitFilesToBranch.mock.calls[0][0];
+        const updatedArtifacts = calledWithConfig.updatedArtifacts;
+        expect(findFileContent(updatedArtifacts, 'modified_file')).toBe(
+          'modified file content again'
+        );
+        expect(
+          findFileContent(updatedArtifacts, 'deleted_then_created_file')
+        ).toBe('this file was once deleted');
+        expect(
+          updatedArtifacts?.find(
+            (f) =>
+              f.type === 'deletion' && f.path === 'deleted_then_created_file'
+          )
+        ).toBeUndefined();
+        expect(
+          updatedArtifacts?.find(
+            (f) =>
+              f.type === 'addition' && f.path === 'modified_then_deleted_file'
+          )
+        ).toBeUndefined();
+        expect(
+          updatedArtifacts?.find(
+            (f) =>
+              f.type === 'deletion' && f.path === 'modified_then_deleted_file'
+          )
+        ).toBeDefined();
+      });
+
+      it('executes post-upgrade tasks once when set to branch mode', async () => {
+        const updatedPackageFile: FileChange = {
+          type: 'addition',
+          path: 'pom.xml',
+          contents: 'pom.xml file contents',
+        };
+        getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+          updatedPackageFiles: [updatedPackageFile],
+          artifactErrors: [],
+          updatedArtifacts: [],
+        } as PackageFilesResult);
+        npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+          artifactErrors: [],
+          updatedArtifacts: [
+            {
+              type: 'addition',
+              path: 'yarn.lock',
+              contents: Buffer.from([1, 2, 3]) /* Binary content */,
+            },
+          ],
+        } as WriteExistingFilesResult);
+        git.branchExists.mockReturnValue(true);
+        platform.getBranchPr.mockResolvedValueOnce({
+          title: 'rebase!',
+          state: PrState.Open,
+          bodyStruct: {
+            hash: hashBody(`- [x] <!-- rebase-check -->`),
+            rebaseRequested: true,
+          },
+        } as Pr);
+        git.isBranchModified.mockResolvedValueOnce(true);
+        git.getRepoStatus.mockResolvedValueOnce(
+          partial<StatusResult>({
+            modified: ['modified_file', 'modified_then_deleted_file'],
+            not_added: [],
+            deleted: ['deleted_file', 'deleted_then_created_file'],
+          })
+        );
+
+        fs.readLocalFile
+          .mockResolvedValueOnce('modified file content')
+          .mockResolvedValueOnce('this file will not exists');
+        fs.localPathExists
+          .mockResolvedValueOnce(true)
+          .mockResolvedValueOnce(true);
+        fs.localPathIsFile
+          .mockResolvedValueOnce(true)
+          .mockResolvedValueOnce(true);
+
+        schedule.isScheduledNow.mockReturnValueOnce(false);
+        commit.commitFilesToBranch.mockResolvedValueOnce(null);
+
+        GlobalConfig.set({
+          ...adminConfig,
+          allowedPostUpgradeCommands: ['^echo hardcoded-string$'],
+          allowPostUpgradeCommandTemplating: true,
+          trustLevel: 'high',
+          localDir: '/localDir',
+        });
+
+        const inconfig: BranchConfig = {
+          ...config,
+          postUpgradeTasks: {
+            executionMode: 'branch',
+            commands: ['echo hardcoded-string', 'disallowed task'],
+            fileFilters: [
+              'modified_file',
+              'deleted_file',
+              'deleted_then_created_file',
+              'modified_then_deleted_file',
+            ],
+          },
+          upgrades: [
+            {
+              ...defaultConfig,
+              depName: 'some-dep-name-1',
+              postUpgradeTasks: {
+                executionMode: 'branch',
+                commands: ['echo hardcoded-string', 'disallowed task'],
+                fileFilters: [
+                  'modified_file',
+                  'deleted_file',
+                  'deleted_then_created_file',
+                  'modified_then_deleted_file',
+                ],
+              },
+            } as BranchUpgradeConfig,
+            {
+              ...defaultConfig,
+              depName: 'some-dep-name-2',
+              postUpgradeTasks: {
+                executionMode: 'branch',
+                commands: ['echo hardcoded-string', 'disallowed task'],
+                fileFilters: [
+                  'modified_file',
+                  'deleted_file',
+                  'deleted_then_created_file',
+                  'modified_then_deleted_file',
+                ],
+              },
+            } as BranchUpgradeConfig,
+          ],
+        };
+
+        const result = await branchWorker.processBranch(inconfig);
+        expect(result).toEqual({
+          branchExists: true,
+          prNo: undefined,
+          result: 'done',
+        });
+        expect(exec.exec).toHaveBeenNthCalledWith(1, 'echo hardcoded-string', {
+          cwd: '/localDir',
+        });
+        expect(exec.exec).toHaveBeenCalledTimes(1);
+        expect(
+          findFileContent(
+            commit.commitFilesToBranch.mock.calls[0][0].updatedArtifacts,
+            'modified_file'
+          )
+        ).toBe('modified file content');
+      });
+    });
+
+    it('throws error if lock file errors and new releaseTimestamp', async () => {
+      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
+        updatedPackageFiles: [{}],
+      } as PackageFilesResult);
+      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+        artifactErrors: [{}],
+        updatedArtifacts: [{}],
+      } as WriteExistingFilesResult);
       git.branchExists.mockReturnValue(false);
-      const res = await branchWorker.processBranch(config);
-      expect(res).toEqual({
-        branchExists: false,
-        prNo: undefined,
-        result: 'pending',
-      });
-    });
-
-    it('skips branch if not stabilityDays not met', async () => {
-      schedule.isScheduledNow.mockReturnValueOnce(true);
-      config.prCreation = 'not-pending';
-      (config.upgrades as Partial<BranchUpgradeConfig>[]) = [
-        {
-          releaseTimestamp: '2099-12-31',
-          stabilityDays: 1,
-        },
-      ];
-      const res = await branchWorker.processBranch(config);
-      expect(res).toEqual({
-        branchExists: false,
-        prNo: undefined,
-        result: 'pending',
-      });
-    });
-
-    it('skips branch if minimumConfidence not met', async () => {
-      schedule.isScheduledNow.mockReturnValueOnce(true);
-      config.prCreation = 'not-pending';
-      (config.upgrades as Partial<BranchUpgradeConfig>[]) = [
-        {
-          minimumConfidence: 'high',
-        },
-      ];
-      mergeConfidence.isActiveConfidenceLevel.mockReturnValue(true);
-      mergeConfidence.satisfiesConfidenceLevel.mockReturnValueOnce(false);
-      const res = await branchWorker.processBranch(config);
-      expect(res).toEqual({
-        branchExists: false,
-        prNo: undefined,
-        result: 'error',
-      });
-    });
-
-    it('processes branch if minimumConfidence is met', async () => {
-      schedule.isScheduledNow.mockReturnValueOnce(true);
-      config.prCreation = 'not-pending';
-      (config.upgrades as Partial<BranchUpgradeConfig>[]) = [
-        {
-          minimumConfidence: 'high',
-        },
-      ];
-      mergeConfidence.isActiveConfidenceLevel.mockReturnValue(true);
-      mergeConfidence.satisfiesConfidenceLevel.mockReturnValueOnce(true);
-      const res = await branchWorker.processBranch(config);
-      expect(res).toEqual({
-        branchExists: false,
-        prNo: undefined,
-        result: 'error',
-      });
-    });
-
-    it('processes branch if not scheduled but updating out of schedule', async () => {
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      config.updateNotScheduled = true;
-      git.branchExists.mockReturnValue(true);
-      platform.getBranchPr.mockResolvedValueOnce({
-        state: PrState.Open,
-      } as Pr);
-      git.isBranchModified.mockResolvedValueOnce(false);
-      await branchWorker.processBranch(config);
-      expect(reuse.shouldReuseExistingBranch).toHaveBeenCalled();
-    });
-
-    it('skips branch if closed major PR found', async () => {
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      git.branchExists.mockReturnValue(true);
-      config.updateType = 'major';
-      checkExisting.prAlreadyExisted.mockResolvedValueOnce({
-        number: 13,
-        state: PrState.Closed,
-      } as Pr);
-      await branchWorker.processBranch(config);
-      expect(reuse.shouldReuseExistingBranch).toHaveBeenCalledTimes(0);
-    });
-
-    it('skips branch if closed digest PR found', async () => {
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      git.branchExists.mockReturnValue(true);
-      config.updateType = 'digest';
-      checkExisting.prAlreadyExisted.mockResolvedValueOnce({
-        number: 13,
-        state: PrState.Closed,
-      } as Pr);
-      await branchWorker.processBranch(config);
-      expect(reuse.shouldReuseExistingBranch).toHaveBeenCalledTimes(0);
-    });
-
-    it('skips branch if closed minor PR found', async () => {
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      git.branchExists.mockReturnValue(true);
-      checkExisting.prAlreadyExisted.mockResolvedValueOnce({
-        number: 13,
-        state: PrState.Closed,
-      } as Pr);
-      await branchWorker.processBranch(config);
-      expect(reuse.shouldReuseExistingBranch).toHaveBeenCalledTimes(0);
-    });
-
-    it('skips branch if merged PR found', async () => {
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      git.branchExists.mockReturnValue(true);
-      checkExisting.prAlreadyExisted.mockResolvedValueOnce({
-        number: 13,
-        state: PrState.Merged,
-      } as Pr);
-      await branchWorker.processBranch(config);
-      expect(reuse.shouldReuseExistingBranch).toHaveBeenCalledTimes(0);
-    });
-
-    it('throws error if closed PR found', async () => {
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      git.branchExists.mockReturnValue(true);
-      platform.getBranchPr.mockResolvedValueOnce({
-        state: PrState.Merged,
-      } as Pr);
-      git.isBranchModified.mockResolvedValueOnce(true);
+      automerge.tryBranchAutomerge.mockResolvedValueOnce('failed');
+      prWorker.ensurePr.mockResolvedValueOnce({
+        type: 'with-pr',
+        pr: {},
+      } as ResultWithPr);
+      prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: true });
+      config.releaseTimestamp = new Date().toISOString();
       await expect(branchWorker.processBranch(config)).rejects.toThrow(
-        REPOSITORY_CHANGED
+        Error(MANAGER_LOCKFILE_ERROR)
       );
     });
 
-    it('does not skip branch if edited PR found with rebaseLabel', async () => {
-      schedule.isScheduledNow.mockReturnValueOnce(false);
+    it('returns when rebaseWhen=never', async () => {
       git.branchExists.mockReturnValue(true);
-      platform.getBranchPr.mockResolvedValueOnce({
-        state: PrState.Open,
-        labels: ['rebase'],
-      } as Pr);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      const res = await branchWorker.processBranch(config);
-      expect(res).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'error',
-      });
+      expect(
+        await branchWorker.processBranch({ ...config, rebaseWhen: 'never' })
+      ).toMatchObject({ result: BranchResult.NoWork });
+      expect(commit.commitFilesToBranch).not.toHaveBeenCalled();
     });
 
-    it('skips branch if edited PR found', async () => {
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      jest.spyOn(prWorker, 'updatePrDebugData').mockReturnValueOnce({
-        updatedInVer: '1.0.3',
-        createdInVer: '1.0.2',
-      });
-      git.branchExists.mockReturnValue(true);
-      platform.getBranchPr.mockResolvedValueOnce({
-        state: PrState.Open,
-        body: '**Rebasing**: something',
-      } as Pr);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      const res = await branchWorker.processBranch(config);
-      expect(res).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'pr-edited',
-      });
-    });
-
-    it('skips branch if target branch changed', async () => {
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      jest.spyOn(prWorker, 'updatePrDebugData').mockReturnValueOnce({
-        updatedInVer: '1.0.3',
-        createdInVer: '1.0.2',
-      });
-      git.branchExists.mockReturnValue(true);
-      platform.getBranchPr.mockResolvedValueOnce({
-        state: PrState.Open,
-        targetBranch: 'v6',
-      } as Pr);
-      git.isBranchModified.mockResolvedValueOnce(false);
-      config.baseBranch = 'master';
-      const res = await branchWorker.processBranch(config);
-      expect(res).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'pr-edited',
-      });
-    });
-
-    it('skips branch if branch edited and no PR found', async () => {
-      git.branchExists.mockReturnValue(true);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      const res = await branchWorker.processBranch(config);
-      expect(res).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'pr-edited',
-      });
-    });
-
-    it('continues branch if branch edited and but PR found', async () => {
-      git.branchExists.mockReturnValue(true);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      git.getBranchCommit.mockReturnValueOnce('123test');
-      platform.findPr.mockResolvedValueOnce({ sha: '123test' } as any);
-      const res = await branchWorker.processBranch(config);
-      expect(res).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'error',
-      });
-    });
-
-    it('skips branch if branch edited and and PR found with sha mismatch', async () => {
-      git.branchExists.mockReturnValue(true);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      git.getBranchCommit.mockReturnValueOnce('123test');
-      platform.findPr.mockResolvedValueOnce({ sha: 'def456' } as any);
-      const res = await branchWorker.processBranch(config);
-      expect(res).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'pr-edited',
-      });
-    });
-
-    it('returns if branch creation limit exceeded', async () => {
+    it('does nothing when branchPrefixOld/branch and its pr exists', async () => {
       getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
         ...updatedPackageFiles,
       });
@@ -398,52 +1533,29 @@ describe('workers/repository/update/branch/index', () => {
         artifactErrors: [],
         updatedArtifacts: [],
       });
-      limits.isLimitReached.mockReturnValueOnce(true);
-      limits.isLimitReached.mockReturnValueOnce(false);
-      expect(await branchWorker.processBranch(config)).toEqual({
-        branchExists: false,
-        prNo: undefined,
-        result: 'branch-limit-reached',
-      });
-    });
-
-    it('returns if pr creation limit exceeded and branch exists', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        ...updatedPackageFiles,
-      });
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [],
-      });
-      git.branchExists.mockReturnValue(true);
-      prWorker.ensurePr.mockResolvedValueOnce({
-        type: 'without-pr',
-        prBlockedBy: 'RateLimited',
-      });
-      limits.isLimitReached.mockReturnValue(false);
-      expect(await branchWorker.processBranch(config)).toEqual({
+      git.branchExists.mockReturnValueOnce(false);
+      git.branchExists.mockReturnValueOnce(true);
+      platform.getBranchPr.mockResolvedValueOnce(
+        partial<Pr>({
+          sourceBranch: 'old/some-branch',
+          state: PrState.Open,
+        })
+      );
+      const inconfig = {
+        ...config,
+        branchName: 'new/some-branch',
+        branchPrefix: 'new/',
+        branchPrefixOld: 'old/',
+      };
+      expect(await branchWorker.processBranch(inconfig)).toEqual({
         branchExists: true,
-        prBlockedBy: 'RateLimited',
-        result: 'pr-limit-reached',
-      });
-    });
-
-    it('returns if commit limit exceeded', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        ...updatedPackageFiles,
-      });
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [],
-      });
-      git.branchExists.mockReturnValue(false);
-      limits.isLimitReached.mockReturnValueOnce(false);
-      limits.isLimitReached.mockReturnValueOnce(true);
-      expect(await branchWorker.processBranch(config)).toEqual({
-        branchExists: false,
         prNo: undefined,
-        result: 'commit-limit-reached',
+        result: 'done',
       });
+      expect(logger.debug).toHaveBeenCalledWith('Found existing branch PR');
+      expect(logger.debug).toHaveBeenCalledWith(
+        'No package files need updating'
+      );
     });
 
     it('returns if no work', async () => {
@@ -464,71 +1576,12 @@ describe('workers/repository/update/branch/index', () => {
     });
 
     it('returns if pending checks', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        ...updatedPackageFiles,
-      });
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [],
-      });
       config.pendingChecks = true;
       expect(await branchWorker.processBranch(config)).toEqual({
         branchExists: false,
         prNo: undefined,
         result: 'pending',
       });
-    });
-
-    it('returns if branch automerged', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [{}],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [partial<FileChange>({})],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      automerge.tryBranchAutomerge.mockResolvedValueOnce('automerged');
-      await branchWorker.processBranch(config);
-      expect(automerge.tryBranchAutomerge).toHaveBeenCalledTimes(1);
-      expect(prWorker.ensurePr).toHaveBeenCalledTimes(0);
-    });
-
-    it('returns if branch automerged and no checks', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [{}],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [partial<FileChange>({})],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(false);
-      automerge.tryBranchAutomerge.mockResolvedValueOnce('automerged');
-      await branchWorker.processBranch({
-        ...config,
-        ignoreTests: true,
-      });
-      expect(automerge.tryBranchAutomerge).toHaveBeenCalledTimes(1);
-      expect(prWorker.ensurePr).toHaveBeenCalledTimes(0);
-    });
-
-    it('returns if branch automerged (dry-run)', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [{}],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [partial<FileChange>({})],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      automerge.tryBranchAutomerge.mockResolvedValueOnce('automerged');
-      GlobalConfig.set({ ...adminConfig, dryRun: 'full' });
-      await branchWorker.processBranch(config);
-      expect(automerge.tryBranchAutomerge).toHaveBeenCalledTimes(1);
-      expect(prWorker.ensurePr).toHaveBeenCalledTimes(0);
-      expect(git.deleteBranch).toHaveBeenCalledTimes(0);
     });
 
     it('returns if branch exists and prCreation set to approval', async () => {
@@ -654,18 +1707,14 @@ describe('workers/repository/update/branch/index', () => {
         artifactErrors: [],
         updatedArtifacts: [partial<FileChange>({})],
       } as WriteExistingFilesResult);
-
-      mockedFunction(needsChangelogs).mockReturnValueOnce(true);
-
-      expect(
-        await branchWorker.processBranch({
-          ...config,
-          ignoreTests: true,
-          prCreation: 'not-pending',
-          commitBody: '[skip-ci]',
-          fetchReleaseNotes: true,
-        })
-      ).toEqual({
+      const inconfig = {
+        ...config,
+        ignoreTests: true,
+        prCreation: 'not-pending',
+        commitBody: '[skip-ci]',
+        fetchReleaseNotes: true,
+      } as BranchConfig;
+      expect(await branchWorker.processBranch(inconfig)).toEqual({
         branchExists: true,
         prNo: undefined,
         result: 'pending',
@@ -673,1061 +1722,6 @@ describe('workers/repository/update/branch/index', () => {
 
       expect(automerge.tryBranchAutomerge).toHaveBeenCalledTimes(0);
       expect(prWorker.ensurePr).toHaveBeenCalledTimes(0);
-    });
-
-    it('ensures PR and tries automerge', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [{}],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [partial<FileChange>({})],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      automerge.tryBranchAutomerge.mockResolvedValueOnce('failed');
-      prWorker.ensurePr.mockResolvedValueOnce({
-        type: 'with-pr',
-        pr: {},
-      } as ResultWithPr);
-      prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: true });
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      await branchWorker.processBranch({ ...config, automerge: true });
-      expect(prWorker.ensurePr).toHaveBeenCalledTimes(1);
-      expect(platform.ensureCommentRemoval).toHaveBeenCalledTimes(0);
-      expect(prAutomerge.checkAutoMerge).toHaveBeenCalledTimes(1);
-    });
-
-    it('ensures PR when impossible to automerge', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [{}],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [partial<FileChange>({})],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      automerge.tryBranchAutomerge.mockResolvedValueOnce('stale');
-      prWorker.ensurePr.mockResolvedValueOnce({
-        type: 'with-pr',
-        pr: {},
-      } as ResultWithPr);
-      prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: false });
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      await branchWorker.processBranch({
-        ...config,
-        automerge: true,
-        rebaseWhen: 'conflicted',
-      });
-      expect(prWorker.ensurePr).toHaveBeenCalledTimes(1);
-      expect(platform.ensureCommentRemoval).toHaveBeenCalledTimes(0);
-      expect(prAutomerge.checkAutoMerge).toHaveBeenCalledTimes(1);
-    });
-
-    it('skips when automerge is off schedule', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce(
-        partial<PackageFilesResult>({})
-      );
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce(
-        partial<WriteExistingFilesResult>({
-          artifactErrors: [],
-          updatedArtifacts: [],
-        })
-      );
-      git.branchExists.mockReturnValue(true);
-      automerge.tryBranchAutomerge.mockResolvedValueOnce('off schedule');
-      prWorker.ensurePr.mockResolvedValueOnce(
-        partial<ResultWithPr>({ type: 'with-pr' })
-      );
-      prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: false });
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      await expect(
-        branchWorker.processBranch({
-          ...config,
-          automerge: true,
-          rebaseWhen: 'conflicted',
-        })
-      ).resolves.toEqual({
-        branchExists: true,
-        result: BranchResult.NotScheduled,
-      });
-      expect(logger.debug).toHaveBeenCalledWith(
-        'Branch cannot automerge now because automergeSchedule is off schedule - skipping'
-      );
-      expect(prWorker.ensurePr).toHaveBeenCalledTimes(0);
-      expect(platform.ensureCommentRemoval).toHaveBeenCalledTimes(0);
-      expect(prAutomerge.checkAutoMerge).toHaveBeenCalledTimes(0);
-    });
-
-    it('ensures PR and adds lock file error comment if no releaseTimestamp', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [{}],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [{}],
-        updatedArtifacts: [{}],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      automerge.tryBranchAutomerge.mockResolvedValueOnce('failed');
-      prWorker.ensurePr.mockResolvedValueOnce({
-        type: 'with-pr',
-        pr: {},
-      } as ResultWithPr);
-      prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: true });
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      await branchWorker.processBranch(config);
-      expect(platform.ensureComment).toHaveBeenCalledTimes(1);
-      expect(prWorker.ensurePr).toHaveBeenCalledTimes(1);
-      expect(prAutomerge.checkAutoMerge).toHaveBeenCalledTimes(0);
-    });
-
-    it('ensures PR and adds lock file error comment if old releaseTimestamp', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [{}],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [{}],
-        updatedArtifacts: [{}],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      automerge.tryBranchAutomerge.mockResolvedValueOnce('failed');
-      prWorker.ensurePr.mockResolvedValueOnce({
-        type: 'with-pr',
-        pr: {},
-      } as ResultWithPr);
-      prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: true });
-      config.releaseTimestamp = '2018-04-26T05:15:51.877Z';
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      await branchWorker.processBranch(config);
-      expect(platform.ensureComment).toHaveBeenCalledTimes(1);
-      expect(prWorker.ensurePr).toHaveBeenCalledTimes(1);
-      expect(prAutomerge.checkAutoMerge).toHaveBeenCalledTimes(0);
-    });
-
-    it('ensures PR and adds lock file error comment if new releaseTimestamp and branch exists', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [{}],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [{}],
-        updatedArtifacts: [{}],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      automerge.tryBranchAutomerge.mockResolvedValueOnce('failed');
-      prWorker.ensurePr.mockResolvedValueOnce({
-        type: 'with-pr',
-        pr: {},
-      } as ResultWithPr);
-      prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: true });
-      config.releaseTimestamp = new Date().toISOString();
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      await branchWorker.processBranch(config);
-      expect(platform.ensureComment).toHaveBeenCalledTimes(1);
-      expect(prWorker.ensurePr).toHaveBeenCalledTimes(1);
-      expect(prAutomerge.checkAutoMerge).toHaveBeenCalledTimes(0);
-    });
-
-    it('throws error if lock file errors and new releaseTimestamp', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [{}],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [{}],
-        updatedArtifacts: [{}],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(false);
-      automerge.tryBranchAutomerge.mockResolvedValueOnce('failed');
-      prWorker.ensurePr.mockResolvedValueOnce({
-        type: 'with-pr',
-        pr: {},
-      } as ResultWithPr);
-      prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: true });
-      config.releaseTimestamp = new Date().toISOString();
-      await expect(branchWorker.processBranch(config)).rejects.toThrow(
-        Error(MANAGER_LOCKFILE_ERROR)
-      );
-    });
-
-    it('ensures PR and adds lock file error comment recreate closed', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [{}],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [{}],
-        updatedArtifacts: [{}],
-      } as WriteExistingFilesResult);
-      config.recreateClosed = true;
-      git.branchExists.mockReturnValue(true);
-      automerge.tryBranchAutomerge.mockResolvedValueOnce('failed');
-      prWorker.ensurePr.mockResolvedValueOnce({
-        type: 'with-pr',
-        pr: {},
-      } as ResultWithPr);
-      prAutomerge.checkAutoMerge.mockResolvedValueOnce({ automerged: true });
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      await branchWorker.processBranch(config);
-      expect(platform.ensureComment).toHaveBeenCalledTimes(1);
-      expect(prWorker.ensurePr).toHaveBeenCalledTimes(1);
-      expect(prAutomerge.checkAutoMerge).toHaveBeenCalledTimes(0);
-    });
-
-    it('swallows branch errors', async () => {
-      getUpdated.getUpdatedPackageFiles.mockImplementationOnce(() => {
-        throw new Error('some error');
-      });
-      const processBranchResult = await branchWorker.processBranch(config);
-      expect(processBranchResult).toEqual({
-        branchExists: false,
-        prNo: undefined,
-        result: 'error',
-      });
-    });
-
-    it('throws and swallows branch errors', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [{}],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [{}],
-        updatedArtifacts: [{}],
-      } as WriteExistingFilesResult);
-      const processBranchResult = await branchWorker.processBranch(config);
-      expect(processBranchResult).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'pr-created',
-      });
-    });
-
-    it('swallows pr errors', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [{}],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [partial<FileChange>({})],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      automerge.tryBranchAutomerge.mockResolvedValueOnce('failed');
-      prWorker.ensurePr.mockImplementationOnce(() => {
-        throw new Error('some error');
-      });
-      const processBranchResult = await branchWorker.processBranch(config);
-      expect(processBranchResult).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'done',
-      });
-    });
-
-    it('closed pr (dry run)', async () => {
-      git.branchExists.mockReturnValue(true);
-      checkExisting.prAlreadyExisted.mockResolvedValueOnce({
-        state: PrState.Closed,
-      } as Pr);
-      GlobalConfig.set({ ...adminConfig, dryRun: 'full' });
-      expect(await branchWorker.processBranch(config)).toEqual({
-        branchExists: false,
-        prNo: undefined,
-        result: 'already-existed',
-      });
-    });
-
-    it('branch pr no rebase (dry run)', async () => {
-      git.branchExists.mockReturnValue(true);
-      jest.spyOn(prWorker, 'updatePrDebugData').mockReturnValueOnce({
-        updatedInVer: '1.0.3',
-        createdInVer: '1.0.2',
-      });
-      platform.getBranchPr.mockResolvedValueOnce({
-        state: PrState.Open,
-      } as Pr);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      GlobalConfig.set({ ...adminConfig, dryRun: 'full' });
-      expect(await branchWorker.processBranch(config)).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'pr-edited',
-      });
-      expect(logger.info).toHaveBeenCalledWith(
-        `DRY-RUN: Would update existing PR to indicate that rebasing is not possible`
-      );
-      expect(platform.updatePr).toHaveBeenCalledTimes(0);
-    });
-
-    it('branch pr no schedule lockfile (dry run)', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [{}],
-        artifactErrors: [{}],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [partial<FileChange>({})],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      platform.getBranchPr.mockResolvedValueOnce({
-        title: 'rebase!',
-        state: PrState.Open,
-        bodyStruct: {
-          hash: hashBody(`- [x] <!-- rebase-check -->`),
-          rebaseRequested: true,
-        },
-      } as Pr);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      GlobalConfig.set({ ...adminConfig, dryRun: 'full' });
-      expect(
-        await branchWorker.processBranch({
-          ...config,
-          updateType: 'lockFileMaintenance',
-          reuseExistingBranch: false,
-          updatedArtifacts: [{ type: 'deletion', path: 'dummy' }],
-        })
-      ).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'done',
-      });
-    });
-
-    it('branch pr no schedule (dry run)', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [{}],
-        artifactErrors: [{}],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [partial<FileChange>({})],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      platform.getBranchPr.mockResolvedValueOnce({
-        title: 'rebase!',
-        state: PrState.Open,
-        bodyStruct: {
-          hash: hashBody(`- [x] <!-- rebase-check -->`),
-          rebaseRequested: true,
-        },
-      } as Pr);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      prWorker.ensurePr.mockResolvedValueOnce({
-        type: 'with-pr',
-        pr: {},
-      } as ResultWithPr);
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      GlobalConfig.set({ ...adminConfig, dryRun: 'full' });
-      expect(
-        await branchWorker.processBranch({
-          ...config,
-          artifactErrors: [{}],
-        })
-      ).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'done',
-      });
-    });
-
-    it('branch pr no schedule', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce(
-        partial<PackageFilesResult>({
-          updatedPackageFiles: [partial<FileChange>({})],
-          artifactErrors: [],
-          updatedArtifacts: [],
-        })
-      );
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [partial<FileChange>({})],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      platform.getBranchPr.mockResolvedValueOnce({
-        title: 'rebase!',
-        state: PrState.Open,
-        bodyStruct: {
-          hash: hashBody(`- [x] <!-- rebase-check -->`),
-          rebaseRequested: true,
-        },
-      } as Pr);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      expect(
-        await branchWorker.processBranch({
-          ...config,
-          updateType: 'lockFileMaintenance',
-          reuseExistingBranch: false,
-          updatedArtifacts: [{ type: 'deletion', path: 'dummy' }],
-        })
-      ).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'done',
-      });
-    });
-
-    it('skips branch update if stopUpdatingLabel presents', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce(
-        partial<PackageFilesResult>({
-          updatedPackageFiles: [partial<FileChange>({})],
-          artifactErrors: [],
-          updatedArtifacts: [],
-        })
-      );
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [partial<FileChange>({})],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      platform.getBranchPr.mockResolvedValueOnce({
-        title: 'rebase!',
-        state: PrState.Open,
-        labels: ['stop-updating'],
-        bodyStruct: { hash: hashBody(`- [ ] <!-- rebase-check -->`) },
-      } as Pr);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      expect(
-        await branchWorker.processBranch({
-          ...config,
-          dependencyDashboardChecks: { 'renovate/some-branch': 'true' },
-          updatedArtifacts: [{ type: 'deletion', path: 'dummy' }],
-        })
-      ).toMatchInlineSnapshot(`
-        Object {
-          "branchExists": true,
-          "prNo": undefined,
-          "result": "no-work",
-        }
-      `);
-      expect(commit.commitFilesToBranch).not.toHaveBeenCalled();
-    });
-
-    it('updates branch if stopUpdatingLabel presents and PR rebase/retry box checked', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce(
-        partial<PackageFilesResult>({
-          updatedPackageFiles: [partial<FileChange>({})],
-          artifactErrors: [],
-          updatedArtifacts: [],
-        })
-      );
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [partial<FileChange>({})],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      platform.getBranchPr.mockResolvedValueOnce({
-        title: 'Update dependency',
-        state: PrState.Open,
-        labels: ['stop-updating'],
-        bodyStruct: {
-          hash: hashBody(`- [x] <!-- rebase-check -->`),
-          rebaseRequested: true,
-        },
-      } as Pr);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      expect(
-        await branchWorker.processBranch({
-          ...config,
-          reuseExistingBranch: false,
-          updatedArtifacts: [{ type: 'deletion', path: 'dummy' }],
-        })
-      ).toMatchInlineSnapshot(`
-        Object {
-          "branchExists": true,
-          "prNo": undefined,
-          "result": "done",
-        }
-      `);
-      expect(commit.commitFilesToBranch).toHaveBeenCalled();
-    });
-
-    it('executes post-upgrade tasks if trust is high', async () => {
-      const updatedPackageFile: FileChange = {
-        type: 'addition',
-        path: 'pom.xml',
-        contents: 'pom.xml file contents',
-      };
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [updatedPackageFile],
-        artifactErrors: [],
-        updatedArtifacts: [],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [
-          {
-            type: 'addition',
-            path: 'yarn.lock',
-            contents: Buffer.from([1, 2, 3]) /* Binary content */,
-          },
-        ],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      platform.getBranchPr.mockResolvedValueOnce({
-        title: 'rebase!',
-        state: PrState.Open,
-        bodyStruct: {
-          hash: hashBody(`- [x] <!-- rebase-check -->`),
-          rebaseRequested: true,
-        },
-      } as Pr);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      git.getRepoStatus.mockResolvedValueOnce(
-        partial<StatusResult>({
-          modified: ['modified_file'],
-          not_added: [],
-          deleted: ['deleted_file'],
-        })
-      );
-      fs.readLocalFile.mockResolvedValueOnce('modified file content');
-      fs.localPathExists
-        .mockResolvedValueOnce(true)
-        .mockResolvedValueOnce(true);
-      fs.localPathIsFile
-        .mockResolvedValueOnce(true)
-        .mockResolvedValueOnce(true);
-
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-
-      GlobalConfig.set({
-        ...adminConfig,
-        allowedPostUpgradeCommands: ['^echo {{{versioning}}}$'],
-        allowPostUpgradeCommandTemplating: true,
-        exposeAllEnv: true,
-        localDir: '/localDir',
-      });
-
-      const result = await branchWorker.processBranch({
-        ...config,
-        postUpgradeTasks: {
-          executionMode: 'update',
-          commands: ['echo {{{versioning}}}', 'disallowed task'],
-          fileFilters: ['modified_file', 'deleted_file'],
-        },
-        upgrades: [
-          {
-            ...defaultConfig,
-            depName: 'some-dep-name',
-            postUpgradeTasks: {
-              executionMode: 'update',
-              commands: ['echo {{{versioning}}}', 'disallowed task'],
-              fileFilters: ['modified_file', 'deleted_file'],
-            },
-          } as BranchUpgradeConfig,
-        ],
-      });
-
-      expect(result).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'done',
-      });
-      const errorMessage = expect.stringContaining(
-        "Post-upgrade command 'disallowed task' has not been added to the allowed list in allowedPostUpgradeCommand"
-      );
-      expect(platform.ensureComment).toHaveBeenCalledWith(
-        expect.objectContaining({
-          content: errorMessage,
-        })
-      );
-      expect(sanitize.sanitize).toHaveBeenCalledWith(errorMessage);
-    });
-
-    it('handles post-upgrade task exec errors', async () => {
-      const updatedPackageFile: FileChange = {
-        type: 'addition',
-        path: 'pom.xml',
-        contents: 'pom.xml file contents',
-      };
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [updatedPackageFile],
-        artifactErrors: [],
-      } as never);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [
-          {
-            name: 'yarn.lock',
-            contents: Buffer.from([1, 2, 3]) /* Binary content */,
-          },
-        ],
-      } as never);
-      git.branchExists.mockReturnValue(true);
-      platform.getBranchPr.mockResolvedValueOnce({
-        title: 'rebase!',
-        state: PrState.Open,
-        bodyStruct: {
-          hash: hashBody(`- [x] <!-- rebase-check -->`),
-          rebaseRequested: true,
-        },
-      } as never);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      git.getRepoStatus.mockResolvedValueOnce(
-        partial<StatusResult>({
-          modified: ['modified_file'],
-          not_added: [],
-          deleted: ['deleted_file'],
-        })
-      );
-
-      fs.readLocalFile.mockResolvedValueOnce('modified file content');
-      fs.localPathExists
-        .mockResolvedValueOnce(true)
-        .mockResolvedValueOnce(true);
-      fs.localPathIsFile
-        .mockResolvedValueOnce(true)
-        .mockResolvedValueOnce(true);
-
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-
-      GlobalConfig.set({
-        ...adminConfig,
-        allowedPostUpgradeCommands: ['^exit 1$'],
-        allowPostUpgradeCommandTemplating: true,
-        exposeAllEnv: true,
-        localDir: '/localDir',
-      });
-
-      exec.exec.mockRejectedValue(new Error('Meh, this went wrong!'));
-
-      await branchWorker.processBranch({
-        ...config,
-        upgrades: [
-          {
-            ...defaultConfig,
-            depName: 'some-dep-name',
-            postUpgradeTasks: {
-              commands: ['exit 1'],
-              fileFilters: ['modified_file', 'deleted_file'],
-            },
-          } as never,
-        ],
-      });
-
-      const errorMessage = expect.stringContaining('Meh, this went wrong!');
-      expect(platform.ensureComment).toHaveBeenCalledWith(
-        expect.objectContaining({
-          content: errorMessage,
-        })
-      );
-      expect(sanitize.sanitize).toHaveBeenCalledWith(errorMessage);
-    });
-
-    it('executes post-upgrade tasks with disabled post-upgrade command templating', async () => {
-      const updatedPackageFile: FileChange = {
-        type: 'addition',
-        path: 'pom.xml',
-        contents: 'pom.xml file contents',
-      };
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [updatedPackageFile],
-        artifactErrors: [],
-        updatedArtifacts: [],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [
-          {
-            type: 'addition',
-            path: 'yarn.lock',
-            contents: Buffer.from([1, 2, 3]) /* Binary content */,
-          },
-        ],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      platform.getBranchPr.mockResolvedValueOnce({
-        title: 'rebase!',
-        state: PrState.Open,
-        bodyStruct: {
-          hash: hashBody(`- [x] <!-- rebase-check -->`),
-          rebaseRequested: true,
-        },
-      } as Pr);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      git.getRepoStatus.mockResolvedValueOnce(
-        partial<StatusResult>({
-          modified: ['modified_file'],
-          not_added: [],
-          deleted: ['deleted_file'],
-        })
-      );
-
-      fs.readLocalFile.mockResolvedValueOnce('modified file content');
-      fs.localPathExists
-        .mockResolvedValueOnce(true)
-        .mockResolvedValueOnce(true);
-      fs.localPathIsFile
-        .mockResolvedValueOnce(true)
-        .mockResolvedValueOnce(true);
-
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      GlobalConfig.set({
-        ...adminConfig,
-        allowedPostUpgradeCommands: ['^echo {{{versioning}}}$'],
-        allowPostUpgradeCommandTemplating: false,
-        exposeAllEnv: true,
-        localDir: '/localDir',
-      });
-      const result = await branchWorker.processBranch({
-        ...config,
-        postUpgradeTasks: {
-          executionMode: 'update',
-          commands: ['echo {{{versioning}}}', 'disallowed task'],
-          fileFilters: ['modified_file', 'deleted_file'],
-        },
-        upgrades: [
-          {
-            ...defaultConfig,
-            depName: 'some-dep-name',
-            postUpgradeTasks: {
-              executionMode: 'update',
-              commands: ['echo {{{versioning}}}', 'disallowed task'],
-              fileFilters: ['modified_file', 'deleted_file'],
-            },
-          } as BranchUpgradeConfig,
-        ],
-      });
-
-      expect(result).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'done',
-      });
-      expect(exec.exec).toHaveBeenCalledWith('echo {{{versioning}}}', {
-        cwd: '/localDir',
-      });
-    });
-
-    it('executes post-upgrade tasks with multiple dependecy in one branch', async () => {
-      const updatedPackageFile: FileChange = {
-        type: 'addition',
-        path: 'pom.xml',
-        contents: 'pom.xml file contents',
-      };
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [updatedPackageFile],
-        artifactErrors: [],
-        updatedArtifacts: [],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [
-          {
-            type: 'addition',
-            path: 'yarn.lock',
-            contents: Buffer.from([1, 2, 3]) /* Binary content */,
-          },
-        ],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      platform.getBranchPr.mockResolvedValueOnce({
-        title: 'rebase!',
-        state: PrState.Open,
-        bodyStruct: {
-          hash: hashBody(`- [x] <!-- rebase-check -->`),
-          rebaseRequested: true,
-        },
-      } as Pr);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      git.getRepoStatus
-        .mockResolvedValueOnce(
-          partial<StatusResult>({
-            modified: ['modified_file', 'modified_then_deleted_file'],
-            not_added: [],
-            deleted: ['deleted_file', 'deleted_then_created_file'],
-          })
-        )
-        .mockResolvedValueOnce(
-          partial<StatusResult>({
-            modified: ['modified_file', 'deleted_then_created_file'],
-            not_added: [],
-            deleted: ['deleted_file', 'modified_then_deleted_file'],
-          })
-        );
-
-      fs.readLocalFile
-        .mockResolvedValueOnce('modified file content' as never)
-        .mockResolvedValueOnce('this file will not exists' as never)
-        .mockResolvedValueOnce('modified file content again' as never)
-        .mockResolvedValueOnce('this file was once deleted' as never);
-      fs.localPathExists.mockResolvedValue(true).mockResolvedValueOnce(true);
-      fs.localPathIsFile
-        .mockResolvedValueOnce(true)
-        .mockResolvedValueOnce(true);
-
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-
-      GlobalConfig.set({
-        ...adminConfig,
-        allowedPostUpgradeCommands: ['^echo {{{depName}}}$'],
-        allowPostUpgradeCommandTemplating: true,
-        exposeAllEnv: true,
-        localDir: '/localDir',
-      });
-
-      const inconfig: BranchConfig = {
-        ...config,
-        postUpgradeTasks: {
-          executionMode: 'update',
-          commands: ['echo {{{depName}}}', 'disallowed task'],
-          fileFilters: [
-            'modified_file',
-            'deleted_file',
-            'deleted_then_created_file',
-            'modified_then_deleted_file',
-          ],
-        },
-        upgrades: [
-          {
-            ...defaultConfig,
-            depName: 'some-dep-name-1',
-            postUpgradeTasks: {
-              executionMode: 'update',
-              commands: ['echo {{{depName}}}', 'disallowed task'],
-              fileFilters: [
-                'modified_file',
-                'deleted_file',
-                'deleted_then_created_file',
-                'modified_then_deleted_file',
-              ],
-            },
-          } as BranchUpgradeConfig,
-          {
-            ...defaultConfig,
-            depName: 'some-dep-name-2',
-            postUpgradeTasks: {
-              executionMode: 'update',
-              commands: ['echo {{{depName}}}', 'disallowed task'],
-              fileFilters: [
-                'modified_file',
-                'deleted_file',
-                'deleted_then_created_file',
-                'modified_then_deleted_file',
-              ],
-            },
-          } as BranchUpgradeConfig,
-        ],
-      };
-
-      const result = await branchWorker.processBranch(inconfig);
-
-      expect(result).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'done',
-      });
-      expect(exec.exec).toHaveBeenNthCalledWith(1, 'echo some-dep-name-1', {
-        cwd: '/localDir',
-      });
-      expect(exec.exec).toHaveBeenNthCalledWith(2, 'echo some-dep-name-2', {
-        cwd: '/localDir',
-      });
-      expect(exec.exec).toHaveBeenCalledTimes(2);
-      const calledWithConfig = commit.commitFilesToBranch.mock.calls[0][0];
-      const updatedArtifacts = calledWithConfig.updatedArtifacts;
-      expect(findFileContent(updatedArtifacts, 'modified_file')).toBe(
-        'modified file content again'
-      );
-      expect(
-        findFileContent(updatedArtifacts, 'deleted_then_created_file')
-      ).toBe('this file was once deleted');
-      expect(
-        updatedArtifacts?.find(
-          (f) => f.type === 'deletion' && f.path === 'deleted_then_created_file'
-        )
-      ).toBeUndefined();
-      expect(
-        updatedArtifacts?.find(
-          (f) =>
-            f.type === 'addition' && f.path === 'modified_then_deleted_file'
-        )
-      ).toBeUndefined();
-      expect(
-        updatedArtifacts?.find(
-          (f) =>
-            f.type === 'deletion' && f.path === 'modified_then_deleted_file'
-        )
-      ).toBeDefined();
-    });
-
-    it('executes post-upgrade tasks once when set to branch mode', async () => {
-      const updatedPackageFile: FileChange = {
-        type: 'addition',
-        path: 'pom.xml',
-        contents: 'pom.xml file contents',
-      };
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        updatedPackageFiles: [updatedPackageFile],
-        artifactErrors: [],
-        updatedArtifacts: [],
-      } as PackageFilesResult);
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [
-          {
-            type: 'addition',
-            path: 'yarn.lock',
-            contents: Buffer.from([1, 2, 3]) /* Binary content */,
-          },
-        ],
-      } as WriteExistingFilesResult);
-      git.branchExists.mockReturnValue(true);
-      platform.getBranchPr.mockResolvedValueOnce({
-        title: 'rebase!',
-        state: PrState.Open,
-        bodyStruct: {
-          hash: hashBody(`- [x] <!-- rebase-check -->`),
-          rebaseRequested: true,
-        },
-      } as Pr);
-      git.isBranchModified.mockResolvedValueOnce(true);
-      git.getRepoStatus.mockResolvedValueOnce(
-        partial<StatusResult>({
-          modified: ['modified_file', 'modified_then_deleted_file'],
-          not_added: [],
-          deleted: ['deleted_file', 'deleted_then_created_file'],
-        })
-      );
-
-      fs.readLocalFile
-        .mockResolvedValueOnce('modified file content')
-        .mockResolvedValueOnce('this file will not exists');
-      fs.localPathExists
-        .mockResolvedValueOnce(true)
-        .mockResolvedValueOnce(true);
-      fs.localPathIsFile
-        .mockResolvedValueOnce(true)
-        .mockResolvedValueOnce(true);
-
-      schedule.isScheduledNow.mockReturnValueOnce(false);
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-
-      GlobalConfig.set({
-        ...adminConfig,
-        allowedPostUpgradeCommands: ['^echo hardcoded-string$'],
-        allowPostUpgradeCommandTemplating: true,
-        trustLevel: 'high',
-        localDir: '/localDir',
-      });
-
-      const inconfig: BranchConfig = {
-        ...config,
-        postUpgradeTasks: {
-          executionMode: 'branch',
-          commands: ['echo hardcoded-string', 'disallowed task'],
-          fileFilters: [
-            'modified_file',
-            'deleted_file',
-            'deleted_then_created_file',
-            'modified_then_deleted_file',
-          ],
-        },
-        upgrades: [
-          {
-            ...defaultConfig,
-            depName: 'some-dep-name-1',
-            postUpgradeTasks: {
-              executionMode: 'branch',
-              commands: ['echo hardcoded-string', 'disallowed task'],
-              fileFilters: [
-                'modified_file',
-                'deleted_file',
-                'deleted_then_created_file',
-                'modified_then_deleted_file',
-              ],
-            },
-          } as BranchUpgradeConfig,
-          {
-            ...defaultConfig,
-            depName: 'some-dep-name-2',
-            postUpgradeTasks: {
-              executionMode: 'branch',
-              commands: ['echo hardcoded-string', 'disallowed task'],
-              fileFilters: [
-                'modified_file',
-                'deleted_file',
-                'deleted_then_created_file',
-                'modified_then_deleted_file',
-              ],
-            },
-          } as BranchUpgradeConfig,
-        ],
-      };
-
-      const result = await branchWorker.processBranch(inconfig);
-      expect(result).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'done',
-      });
-      expect(exec.exec).toHaveBeenNthCalledWith(1, 'echo hardcoded-string', {
-        cwd: '/localDir',
-      });
-      expect(exec.exec).toHaveBeenCalledTimes(1);
-      expect(
-        findFileContent(
-          commit.commitFilesToBranch.mock.calls[0][0].updatedArtifacts,
-          'modified_file'
-        )
-      ).toBe('modified file content');
-    });
-
-    it('returns when rebaseWhen=never', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        ...updatedPackageFiles,
-      });
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [],
-      });
-      git.branchExists.mockReturnValue(true);
-      commit.commitFilesToBranch.mockResolvedValueOnce(null);
-      expect(
-        await branchWorker.processBranch({ ...config, rebaseWhen: 'never' })
-      ).toMatchObject({ result: BranchResult.NoWork });
-      expect(commit.commitFilesToBranch).not.toHaveBeenCalled();
-    });
-
-    it('does nothing when branchPrefixOld/branch and its pr exists', async () => {
-      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce({
-        ...updatedPackageFiles,
-      });
-      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
-        artifactErrors: [],
-        updatedArtifacts: [],
-      });
-      git.branchExists.mockReturnValueOnce(false);
-      git.branchExists.mockReturnValueOnce(true);
-      platform.getBranchPr.mockResolvedValueOnce(
-        partial<Pr>({
-          sourceBranch: 'old/some-branch',
-          state: PrState.Open,
-        })
-      );
-      expect(
-        await branchWorker.processBranch({
-          ...config,
-          branchName: 'new/some-branch',
-          branchPrefix: 'new/',
-          branchPrefixOld: 'old/',
-        })
-      ).toEqual({
-        branchExists: true,
-        prNo: undefined,
-        result: 'done',
-      });
-      expect(logger.debug).toHaveBeenCalledWith('Found existing branch PR');
-      expect(logger.debug).toHaveBeenCalledWith(
-        'No package files need updating'
-      );
     });
   });
 });
