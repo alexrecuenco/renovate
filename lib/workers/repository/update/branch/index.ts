@@ -247,6 +247,23 @@ export async function processBranch(
       }
     }
 
+    config.stopUpdating = branchPr?.labels?.includes(config.stopUpdatingLabel!);
+
+    const prRebaseChecked = !!branchPr?.bodyStruct?.rebaseRequested;
+
+    if (branchExists && dependencyDashboardCheck && config.stopUpdating) {
+      if (!prRebaseChecked) {
+        logger.info(
+          'Branch updating is skipped because stopUpdatingLabel is present in config'
+        );
+        return {
+          branchExists: true,
+          prNo: branchPr?.number,
+          result: BranchResult.NoWork,
+        };
+      }
+    }
+
     // Check schedule
     config.isScheduledNow = isScheduledNow(config, 'schedule');
     if (!config.isScheduledNow && !dependencyDashboardCheck) {
@@ -459,23 +476,6 @@ export async function processBranch(
       branchExists &&
       (await isBranchConflicted(config.baseBranch!, config.branchName));
     config.forceCommit = forcedManually || config.isConflicted;
-
-    config.stopUpdating = branchPr?.labels?.includes(config.stopUpdatingLabel!);
-
-    const prRebaseChecked = !!branchPr?.bodyStruct?.rebaseRequested;
-
-    if (branchExists && dependencyDashboardCheck && config.stopUpdating) {
-      if (!prRebaseChecked) {
-        logger.info(
-          'Branch updating is skipped because stopUpdatingLabel is present in config'
-        );
-        return {
-          branchExists: true,
-          prNo: branchPr?.number,
-          result: BranchResult.NoWork,
-        };
-      }
-    }
 
     const commitSha = await commitFilesToBranch(config);
     // istanbul ignore if
