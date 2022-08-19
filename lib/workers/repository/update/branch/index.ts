@@ -22,18 +22,15 @@ import {
   ensureComment,
   ensureCommentRemoval,
 } from '../../../../modules/platform/comment';
-import { hashBody } from '../../../../modules/platform/pr-body';
-import { BranchStatus, PrState } from '../../../../types';
+import { BranchStatus } from '../../../../types';
 import { ExternalHostError } from '../../../../types/errors/external-host-error';
 import { getElapsedDays } from '../../../../util/date';
 import { emojify } from '../../../../util/emoji';
 import {
   checkoutBranch,
   deleteBranch,
-  getBranchCommit,
   branchExists as gitBranchExists,
   isBranchConflicted,
-  isBranchModified,
 } from '../../../../util/git';
 import {
   getMergeConfidenceLevel,
@@ -41,23 +38,19 @@ import {
   satisfiesConfidenceLevel,
 } from '../../../../util/merge-confidence';
 import * as template from '../../../../util/template';
-import { Limit, isLimitReached } from '../../../global/limits';
 import { BranchConfig, BranchResult, PrBlockedBy } from '../../../types';
 import { embedChangelog, needsChangelogs } from '../../changelog';
-// import { embedChangelog, needsChangelogs } from '../../changelog';
-import { ensurePr, getPlatformPrOptions, updatePrDebugData } from '../pr';
+import { ensurePr } from '../pr';
 import { checkAutoMerge } from '../pr/automerge';
-import { getPrBody } from '../pr/body';
 import { setArtifactErrorStatus } from './artifacts';
 import { tryBranchAutomerge } from './automerge';
-import { prAlreadyExisted } from './check-existing';
 import { commitFilesToBranch } from './commit';
 import executePostUpgradeCommands from './execute-post-upgrade-commands';
 import { getUpdatedPackageFiles } from './get-updated';
-import { handlepr } from './handle-existing';
 import { shouldReuseExistingBranch } from './reuse';
 import { isScheduledNow } from './schedule';
 import { setConfidence, setStability } from './status-checks';
+import { validation } from './validation';
 
 function rebaseCheck(config: RenovateConfig, branchPr: Pr): boolean {
   const titleRebase = branchPr.title?.startsWith('rebase!');
@@ -109,151 +102,16 @@ export async function processBranch(
     config.rebaseRequested = rebaseCheck(config, branchPr);
     logger.debug(`PR rebase requested=${config.rebaseRequested}`);
   }
-  const artifactErrorTopic = emojify(':warning: Artifact update problem');
+  const artifactErrorTopic = emojify(':warning: Artifact update problem'); // not necesssary in validation
   try {
-    // Check if branch already existed
-    const existingPr = branchPr ? undefined : await prAlreadyExisted(config);
-    if (existingPr && !dependencyDashboardCheck) {
-      logger.debug(
-        { prTitle: config.prTitle },
-        'Closed PR already exists. Skipping branch.'
-      );
-      await handlepr(config, existingPr);
-      return {
-        branchExists: false,
-        prNo: existingPr.number,
-        result: BranchResult.AlreadyExisted,
-      };
-    }
-    // istanbul ignore if
-    if (!branchExists && config.dependencyDashboardApproval) {
-      if (dependencyDashboardCheck) {
-        logger.debug(`Branch ${config.branchName} is approved for creation`);
-      } else {
-        logger.debug(`Branch ${config.branchName} needs approval`);
-        return {
-          branchExists,
-          prNo: branchPr?.number,
-          result: BranchResult.NeedsApproval,
-        };
-      }
-    }
-    if (
-      !branchExists &&
-      isLimitReached(Limit.Branches) &&
-      !dependencyDashboardCheck &&
-      !config.isVulnerabilityAlert
-    ) {
-      logger.debug('Reached branch limit - skipping branch creation');
-      return {
-        branchExists,
-        prNo: branchPr?.number,
-        result: BranchResult.BranchLimitReached,
-      };
-    }
-    if (
-      isLimitReached(Limit.Commits) &&
-      !dependencyDashboardCheck &&
-      !config.isVulnerabilityAlert
-    ) {
-      logger.debug('Reached commits limit - skipping branch');
-      return {
-        branchExists,
-        prNo: branchPr?.number,
-        result: BranchResult.CommitLimitReached,
-      };
-    }
-    if (
-      !branchExists &&
-      branchConfig.pendingChecks &&
-      !dependencyDashboardCheck
-    ) {
-      return {
-        branchExists: false,
-        prNo: branchPr?.number,
-        result: BranchResult.Pending,
-      };
-    }
-    if (branchExists) {
-      logger.debug('Checking if PR has been edited');
-      const branchIsModified = await isBranchModified(config.branchName);
-      if (branchPr) {
-        logger.debug('Found existing branch PR');
-        if (branchPr.state !== PrState.Open) {
-          logger.debug(
-            'PR has been closed or merged since this run started - aborting'
-          );
-          throw new Error(REPOSITORY_CHANGED);
-        }
-        if (
-          branchIsModified ||
-          (branchPr.targetBranch &&
-            branchPr.targetBranch !== branchConfig.baseBranch)
-        ) {
-          logger.debug({ prNo: branchPr.number }, 'PR has been edited');
-          if (dependencyDashboardCheck || config.rebaseRequested) {
-            logger.debug('Manual rebase has been requested for PR');
-          } else {
-            const newBody = await getPrBody(branchConfig, {
-              debugData: updatePrDebugData(existingPr?.bodyStruct?.debugData),
-              rebasingNotice:
-                'Renovate will not automatically rebase this PR, because other commits have been found.',
-            });
-            const newBodyHash = hashBody(newBody);
-            if (newBodyHash !== branchPr.bodyStruct?.hash) {
-              if (GlobalConfig.get('dryRun')) {
-                logger.info(
-                  `DRY-RUN: Would update existing PR to indicate that rebasing is not possible`
-                );
-              } else {
-                logger.debug(
-                  'Updating existing PR to indicate that rebasing is not possible'
-                );
-                await platform.updatePr({
-                  number: branchPr.number,
-                  prTitle: branchPr.title,
-                  prBody: newBody,
-                  platformOptions: getPlatformPrOptions(config),
-                });
-              }
-            }
-            return {
-              branchExists,
-              prNo: branchPr.number,
-              result: BranchResult.PrEdited,
-            };
-          }
-        }
-      } else if (branchIsModified) {
-        const oldPr = await platform.findPr({
-          branchName: config.branchName,
-          state: PrState.NotOpen,
-        });
-        if (!oldPr) {
-          logger.debug('Branch has been edited but found no PR - skipping');
-          return {
-            branchExists,
-            result: BranchResult.PrEdited,
-          };
-        }
-        const branchSha = getBranchCommit(config.branchName);
-        const oldPrSha = oldPr?.sha;
-        if (!oldPrSha || oldPrSha === branchSha) {
-          logger.debug(
-            { oldPrNumber: oldPr.number, oldPrSha, branchSha },
-            'Found old PR matching this branch - will override it'
-          );
-        } else {
-          logger.debug(
-            { oldPrNumber: oldPr.number, oldPrSha, branchSha },
-            'Found old PR but the SHA is different'
-          );
-          return {
-            branchExists,
-            result: BranchResult.PrEdited,
-          };
-        }
-      }
+    const validationResult = await validation(
+      config,
+      branchPr!,
+      branchExists,
+      dependencyDashboardCheck
+    );
+    if (validationResult) {
+      return validationResult;
     }
 
     // Check schedule
