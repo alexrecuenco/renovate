@@ -26,8 +26,7 @@ export async function updateLockedDependency(
   } = config;
   logger.debug(
     // TODO: types (#7154)
-    // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-    `npm.updateLockedDependency: ${depName}@${currentVersion} -> ${newVersion} [${lockFile}]`
+    `npm.updateLockedDependency: ${depName}@${currentVersion!} -> ${newVersion} [${lockFile}]`
   );
   try {
     let packageJson: PackageJson;
@@ -53,8 +52,7 @@ export async function updateLockedDependency(
     if (lockedDeps.some((dep) => dep.bundled)) {
       logger.info(
         // TODO: types (#7154)
-        // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-        `Package ${depName}@${currentVersion} is bundled and cannot be updated`
+        `Package ${depName}@${currentVersion!} is bundled and cannot be updated`
       );
       return { status: 'update-failed' };
     }
@@ -68,16 +66,14 @@ export async function updateLockedDependency(
       if (newLockedDeps.length) {
         logger.debug(
           // TODO: types (#7154)
-          // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-          `${depName}@${currentVersion} not found in ${lockFile} but ${depName}@${newVersion} was - looks like it's already updated`
+          `${depName}@${currentVersion!} not found in ${lockFile} but ${depName}@${newVersion} was - looks like it's already updated`
         );
         status = 'already-updated';
       } else {
         if (lockfileVersion !== 1) {
           logger.debug(
             // TODO: types (#7154)
-            // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-            `Found lockfileVersion ${packageLockJson.lockfileVersion}`
+            `Found lockfileVersion ${packageLockJson.lockfileVersion!}`
           );
           status = 'update-failed';
         } else if (allowHigherOrRemoved) {
@@ -113,8 +109,8 @@ export async function updateLockedDependency(
         } else {
           logger.debug(
             // TODO: types (#7154)
-            // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-            `${depName}@${currentVersion} not found in ${lockFile} - cannot update`
+
+            `${depName}@${currentVersion!} not found in ${lockFile} - cannot update`
           );
           status = 'update-failed';
         }
@@ -123,10 +119,8 @@ export async function updateLockedDependency(
       // istanbul ignore if: too hard to replicate
       if (isParentUpdate) {
         const files: Record<string, string> = {};
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
-        files[packageFile!] = packageFileContent!;
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
-        files[lockFile!] = lockFileContent!;
+        files[packageFile] = packageFileContent!;
+        files[lockFile] = lockFileContent!;
         return { status, files };
       }
       return { status };
@@ -162,8 +156,8 @@ export async function updateLockedDependency(
         logger.debug(
           `${depName} can be updated to ${newVersion} in-range with matching constraint "${constraint}" in ${
             // TODO: types (#7154)
-            // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-            parentDepName ? `${parentDepName}@${parentVersion}` : packageFile
+
+            parentDepName ? `${parentDepName}@${parentVersion!}` : packageFile
           }`
         );
       } else if (parentDepName && parentVersion) {
@@ -247,8 +241,7 @@ export async function updateLockedDependency(
       if (!parentUpdateResult.files) {
         logger.debug(
           // TODO: types (#7154)
-          // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-          `Update of ${depName} to ${newVersion} impossible due to failed update of parent ${parentUpdate.depName} to ${parentUpdate.newVersion}`
+          `Update of ${depName} to ${newVersion} impossible due to failed update of parent ${parentUpdate.depName!} to ${parentUpdate.newVersion!}`
         );
         return { status: 'update-failed' };
       }

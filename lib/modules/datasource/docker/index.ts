@@ -799,11 +799,8 @@ export class DockerDatasource extends Datasource {
         has_additional: boolean;
       }
 
-      // typescript issue :-/
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
-      const res = (await this.http.getJson<QuayRestDockerTags>(
-        url
-      )) as HttpResponse<QuayRestDockerTags>;
+      const res: HttpResponse<QuayRestDockerTags> =
+        await this.http.getJson<QuayRestDockerTags>(url);
       const pageTags = res.body.tags.map((tag) => tag.name);
       tags = tags.concat(pageTags);
       page += 1;
@@ -983,8 +980,7 @@ export class DockerDatasource extends Datasource {
     );
     logger.debug(
       // TODO: types (#7154)
-      // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-      `getDigest(${registryHost}, ${dockerRepository}, ${newValue})`
+      `getDigest(${registryHost}, ${dockerRepository}, ${newValue!})`
     );
     const newTag = newValue ?? 'latest';
     let digest: string | null = null;

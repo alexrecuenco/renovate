@@ -169,8 +169,7 @@ export async function getReleases(
         packageBaseAddress
       )}${pkgName.toLowerCase()}/${
         // TODO: types (#7154)
-        // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-        latestStable
+        latestStable!
       }/${pkgName.toLowerCase()}.nuspec`;
       const metaresult = await http.get(nuspecUrl);
       const nuspec = new XmlDocument(metaresult.body);

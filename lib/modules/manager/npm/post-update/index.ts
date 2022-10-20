@@ -653,8 +653,7 @@ export async function getAdditionalFiles(
       }
       artifactErrors.push({
         lockFile: yarnLock,
-        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
-        stderr: res.stderr || res.stdout,
+        stderr: res.stderr ?? res.stdout,
       });
     } else {
       const existingContent = await getFile(
@@ -724,8 +723,7 @@ export async function getAdditionalFiles(
       }
       artifactErrors.push({
         lockFile: pnpmShrinkwrap,
-        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
-        stderr: res.stderr || res.stdout,
+        stderr: res.stderr ?? res.stdout,
       });
     } else {
       const existingContent = await getFile(

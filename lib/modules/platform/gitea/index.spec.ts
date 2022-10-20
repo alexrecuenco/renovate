@@ -485,8 +485,7 @@ describe('modules/platform/gitea/index', () => {
       await gitea.initRepo(repoCfg);
 
       // TODO: types (#7154)
-      // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-      const url = new URL(`${mockRepo.clone_url}`);
+      const url = new URL(`${mockRepo.clone_url!}`);
       url.username = token;
       expect(gitvcs.initRepo).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -512,8 +511,7 @@ describe('modules/platform/gitea/index', () => {
       await gitea.initRepo(repoCfg);
 
       // TODO: types (#7154)
-      // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-      const url = new URL(`${mockRepo.clone_url}`);
+      const url = new URL(`${mockRepo.clone_url!}`);
       url.username = token;
       expect(gitvcs.initRepo).toHaveBeenCalledWith(
         expect.objectContaining({ url: url.toString() })

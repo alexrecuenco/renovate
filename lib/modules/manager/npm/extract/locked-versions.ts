@@ -36,8 +36,7 @@ export async function getLockedVersions(
         dep.lockedVersion =
           lockFileCache[yarnLock].lockedVersions[
             // TODO: types (#7154)
-            // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-            `${dep.depName}@${dep.currentValue}`
+            `${dep.depName!}@${dep.currentValue!}`
           ];
         if (
           (dep.depType === 'engines' || dep.depType === 'packageManager') &&
@@ -49,8 +48,7 @@ export async function getLockedVersions(
       }
     } else if (npmLock) {
       // TODO: types (#7154)
-      // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-      logger.debug(`Found ${npmLock} for ${packageFile.packageFile}`);
+      logger.debug(`Found ${npmLock} for ${packageFile.packageFile!}`);
       lockFiles.push(npmLock);
       if (!lockFileCache[npmLock]) {
         logger.trace('Retrieving/parsing ' + npmLock);

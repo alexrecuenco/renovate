@@ -75,8 +75,7 @@ export class JenkinsPluginsDatasource extends Datasource {
         downloadUrl: plugins[name][version]?.url,
         releaseTimestamp: plugins[name][version]?.buildDate
           ? // TODO: types (#7154)
-            // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-            new Date(`${plugins[name][version].buildDate} UTC`)
+            new Date(`${plugins[name][version].buildDate!} UTC`)
           : null,
       }));
     }

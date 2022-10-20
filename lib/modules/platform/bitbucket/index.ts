@@ -263,8 +263,7 @@ export async function findPr({
   state = PrState.All,
 }: FindPRConfig): Promise<Pr | null> {
   // TODO: types (#7154)
-  // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-  logger.debug(`findPr(${branchName}, ${prTitle}, ${state})`);
+  logger.debug(`findPr(${branchName}, ${prTitle!}, ${state})`);
   const prList = await getPrList();
   const pr = prList.find(
     (p) =>
@@ -346,8 +345,7 @@ async function getStatus(
   const sha = await getBranchCommit(branchName);
   return utils.accumulateValues<utils.BitbucketStatus>(
     // TODO: types (#7154)
-    // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-    `/2.0/repositories/${config.repository}/commit/${sha}/statuses`,
+    `/2.0/repositories/${config.repository}/commit/${sha!}/statuses`,
     'get',
     { useCache }
   );
@@ -417,8 +415,7 @@ export async function setBranchStatus({
 
   await bitbucketHttp.postJson(
     // TODO: types (#7154)
-    // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-    `/2.0/repositories/${config.repository}/commit/${sha}/statuses/build`,
+    `/2.0/repositories/${config.repository}/commit/${sha!}/statuses/build`,
     { body }
   );
   // update status cache
@@ -867,8 +864,7 @@ export async function mergePr({
   strategy: mergeStrategy,
 }: MergePRConfig): Promise<boolean> {
   // TODO: types (#7154)
-  // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-  logger.debug(`mergePr(${prNo}, ${branchName}, ${mergeStrategy})`);
+  logger.debug(`mergePr(${prNo}, ${branchName!}, ${mergeStrategy!})`);
 
   // Bitbucket Cloud does not support a rebase-alike; https://jira.atlassian.com/browse/BCLOUD-16610
   if (mergeStrategy === 'rebase') {

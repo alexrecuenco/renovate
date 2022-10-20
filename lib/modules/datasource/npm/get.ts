@@ -42,8 +42,7 @@ function getPackageSource(repository: any): PackageSource {
       res.sourceDirectory = repository.directory;
     }
     // TODO: types (#7154)
-    // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-    const sourceUrlCopy = `${res.sourceUrl}`;
+    const sourceUrlCopy = `${res.sourceUrl!}`;
     const sourceUrlSplit: string[] = sourceUrlCopy.split('/');
     if (sourceUrlSplit.length > 7 && sourceUrlSplit[2] === 'github.com') {
       // Massage the repository URL for non-compliant strings for github (see issue #4610)

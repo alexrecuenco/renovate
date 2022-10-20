@@ -10,8 +10,7 @@ export function updateLockedDependency(
     config;
   logger.debug(
     // TODO: types (#7154)
-    // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-    `composer.updateLockedDependency: ${depName}@${currentVersion} -> ${newVersion} [${lockFile}]`
+    `composer.updateLockedDependency: ${depName}@${currentVersion!} -> ${newVersion} [${lockFile}]`
   );
   try {
     const locked = JSON.parse(lockFileContent!) as ComposerLock;

@@ -186,8 +186,7 @@ function processDepInterpolation({
         if (
           lastToken.type === TokenType.String &&
           // TODO: types (#7154)
-          // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-          lastToken.value.startsWith(`:${dep.currentValue}`)
+          lastToken.value.startsWith(`:${dep.currentValue!}`)
         ) {
           packageFile = packageFileOrig;
           fileReplacePosition = lastToken.offset + 1;
@@ -1196,8 +1195,7 @@ export async function parseGradle(
       logger.warn(
         { packageFile },
         // TODO: types (#7154)
-        // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-        `${packageFile} parsing error, results can be incomplete`
+        `${packageFile!} parsing error, results can be incomplete`
       );
       break;
     }

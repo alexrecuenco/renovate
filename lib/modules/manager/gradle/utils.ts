@@ -29,8 +29,8 @@ export function isDependencyString(input: string): boolean {
   if (split?.length !== 3) {
     return false;
   }
-  // eslint-disable-next-line prefer-const
-  let [tempGroupId, tempArtifactId, tempVersionPart] = split;
+  const [tempGroupId, tempArtifactId] = split;
+  let [, , tempVersionPart] = split;
   if (
     tempVersionPart !== versionLikeSubstring(tempVersionPart) &&
     tempVersionPart.includes('@')

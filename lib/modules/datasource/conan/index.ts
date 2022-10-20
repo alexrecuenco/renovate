@@ -94,8 +94,7 @@ export class ConanDatasource extends Datasource {
     namespace: `datasource-${datasource}`,
     key: ({ registryUrl, packageName }: GetReleasesConfig) =>
       // TODO: types (#7154)
-      // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-      `${registryUrl}:${packageName}`,
+      `${registryUrl!}:${packageName}`,
   })
   async getReleases({
     registryUrl,

@@ -89,8 +89,7 @@ export async function generateLockFile(
         `npm install ${cmdOptions}` +
         lockUpdates
           // TODO: types (#7154)
-          // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-          .map((update) => ` ${update.depName}@${update.newVersion}`)
+          .map((update) => ` ${update.depName!}@${update.newVersion!}`)
           .join('');
       commands.push(updateCmd);
     }

@@ -115,8 +115,7 @@ export async function getRepos(): Promise<string[]> {
   const azureApiGit = await azureApi.gitApi();
   const repos = await azureApiGit.getRepositories();
   // TODO: types (#7154)
-  // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-  return repos.map((repo) => `${repo.project?.name}/${repo.name}`);
+  return repos.map((repo) => `${repo.project!.name!}/${repo.name!}`);
 }
 
 export async function getRawFile(
@@ -694,8 +693,7 @@ export async function mergePr({
       PullRequestStatus[PullRequestStatus.Completed]
     }) with lastMergeSourceCommit ${
       // TODO: types (#7154)
-      // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-      pr.lastMergeSourceCommit?.commitId
+      pr.lastMergeSourceCommit!.commitId!
     } using mergeStrategy ${mergeMethod} (${
       GitPullRequestMergeStrategy[mergeMethod]
     })`

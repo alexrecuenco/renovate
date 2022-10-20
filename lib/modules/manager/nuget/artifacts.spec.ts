@@ -18,10 +18,8 @@ jest.mock('./util');
 const { getConfiguredRegistries, getDefaultRegistries } = mocked(util);
 const hostRules = mocked(_hostRules);
 
-// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
-const realFs = jest.requireActual(
-  '../../../util/fs'
-) as typeof import('../../../util/fs');
+const realFs: typeof import('../../../util/fs') =
+  jest.requireActual('../../../util/fs');
 
 const adminConfig: RepoGlobalConfig = {
   // `join` fixes Windows CI

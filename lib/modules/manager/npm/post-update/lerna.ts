@@ -21,8 +21,7 @@ export function getLernaVersion(
   if (!lernaDep?.currentValue || !semver.validRange(lernaDep.currentValue)) {
     logger.warn(
       // TODO: types (#7154)
-      // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
-      `Could not detect lerna version in ${lernaPackageFile.packageFile}, using 'latest'`
+      `Could not detect lerna version in ${lernaPackageFile.packageFile!}, using 'latest'`
     );
     return null;
   }
