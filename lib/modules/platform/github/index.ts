@@ -26,11 +26,7 @@ import { BranchStatus, PrState, VulnerabilityAlert } from '../../../types';
 import { ExternalHostError } from '../../../types/errors/external-host-error';
 import * as git from '../../../util/git';
 import { listCommitTree, pushCommitToRenovateRef } from '../../../util/git';
-import type {
-  CommitFilesConfig,
-  CommitResult,
-  CommitSha,
-} from '../../../util/git/types';
+import type { CommitFilesConfig, CommitResult } from '../../../util/git/types';
 import * as hostRules from '../../../util/host-rules';
 import * as githubHttp from '../../../util/http/github';
 import { regEx } from '../../../util/regex';
@@ -1673,7 +1669,7 @@ export async function getVulnerabilityAlerts(): Promise<VulnerabilityAlert[]> {
 async function pushFiles(
   { branchName, message }: CommitFilesConfig,
   { parentCommitSha, commitSha }: CommitResult
-): Promise<CommitSha | null> {
+): Promise<string | null> {
   try {
     // Push the commit to GitHub using a custom ref
     // The associated blobs will be pushed automatically
@@ -1720,7 +1716,7 @@ async function pushFiles(
 
 export async function commitFiles(
   config: CommitFilesConfig
-): Promise<CommitSha | null> {
+): Promise<string | null> {
   const commitResult = await git.prepareCommit(config); // Commit locally and don't push
   const { branchName, files } = config;
   if (!commitResult) {

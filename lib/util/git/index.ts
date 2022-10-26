@@ -50,7 +50,6 @@ import { configSigningKey, writePrivateKey } from './private-key';
 import type {
   CommitFilesConfig,
   CommitResult,
-  CommitSha,
   LocalConfig,
   StatusResult,
   StorageConfig,
@@ -486,7 +485,7 @@ export function branchExists(branchName: string): boolean {
 }
 
 // Return the commit SHA for a branch
-export function getBranchCommit(branchName: string): CommitSha | null {
+export function getBranchCommit(branchName: string): string | null {
   return config.branchCommits[branchName] || null;
 }
 
@@ -500,7 +499,7 @@ export async function getCommitMessages(): Promise<string[]> {
   return res.all.map((commit) => commit.message);
 }
 
-export async function checkoutBranch(branchName: string): Promise<CommitSha> {
+export async function checkoutBranch(branchName: string): Promise<string> {
   logger.debug(`Setting current branch to ${branchName}`);
   await syncGit();
   try {
@@ -1043,7 +1042,7 @@ export async function pushCommit({
 export async function fetchCommit({
   branchName,
   files,
-}: CommitFilesConfig): Promise<CommitSha | null> {
+}: CommitFilesConfig): Promise<string | null> {
   await syncGit();
   logger.debug(`Fetching branch ${branchName}`);
   try {
@@ -1060,7 +1059,7 @@ export async function fetchCommit({
 
 export async function commitFiles(
   commitConfig: CommitFilesConfig
-): Promise<CommitSha | null> {
+): Promise<string | null> {
   try {
     const commitResult = await prepareCommit(commitConfig);
     if (commitResult) {

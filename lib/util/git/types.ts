@@ -9,8 +9,6 @@ export interface GitAuthor {
 
 export type GitNoVerifyOption = 'commit' | 'push';
 
-export type CommitSha = string;
-
 export interface StorageConfig {
   currentBranch?: string;
   url: string;
@@ -23,7 +21,7 @@ export interface LocalConfig extends StorageConfig {
   additionalBranches: string[];
   currentBranch: string;
   currentBranchSha: string;
-  branchCommits: Record<string, CommitSha>;
+  branchCommits: Record<string, string>;
   branchIsModified: Record<string, boolean>;
   ignoredAuthors: string[];
   gitAuthorName?: string | null;
