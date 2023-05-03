@@ -23,6 +23,7 @@ renovate-schema.json
 **/*.generated.ts
 tools/dist
 test/datasource/nuget/_fixtures/obj
+.husky
 
 # testing
 /docker-compose.yml
