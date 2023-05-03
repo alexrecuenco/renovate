@@ -3,19 +3,18 @@
 pre-commit:
   parallel: true
   scripts:
-  "not-main":
-  runner: bash
+    'not-main':
+      runner: bash
   commands:
     readme:
-      glob: "*.md"
+      glob: '*.md'
       run: yarn markdownlint-cli2-fix {staged_files}
     js:
-      glob: "**/*.{ts,js,mjs,cjs}"
+      glob: '**/*.{ts,js,mjs,cjs}'
       run: yarn eslint --cache --fix {staged_files}
     all:
-      glob: "*"
+      glob: '*'
       run: yarn prettier --cache --ignore-unknown --write {staged_files}
     ls-lint:
-      glob: "*"
+      glob: '*'
       run: yarn ls-lint {staged_files}
-
