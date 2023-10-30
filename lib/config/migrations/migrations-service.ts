@@ -28,6 +28,7 @@ import { IgnoreNodeModulesMigration } from './custom/ignore-node-modules-migrati
 import { IgnoreNpmrcFileMigration } from './custom/ignore-npmrc-file-migration';
 import { IncludeForksMigration } from './custom/include-forks-migration';
 import { MatchDatasourcesMigration } from './custom/match-datasources-migration';
+import { MatchManagersMigration } from './custom/match-managers-migration';
 import { MatchStringsMigration } from './custom/match-strings-migration';
 import { NodeMigration } from './custom/node-migration';
 import { PackageFilesMigration } from './custom/package-files-migration';
@@ -153,6 +154,7 @@ export class MigrationsService {
     StabilityDaysMigration,
     FetchReleaseNotesMigration,
     CustomManagersMigration,
+    MatchManagersMigration,
   ];
 
   static run(originalConfig: RenovateConfig): RenovateConfig {

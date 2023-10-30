@@ -24,6 +24,11 @@ export function massageConfig(config: RenovateConfig): RenovateConfig {
     } else if (key === 'npmToken' && is.string(val) && val.length < 50) {
       massagedConfig.npmrc = `//registry.npmjs.org/:_authToken=${val}\n`;
       delete massagedConfig.npmToken;
+    } else if (key === 'matchManagers' && is.array<string>(val, is.string)) {
+      massagedConfig[key] = [];
+      val.forEach((mgr) => {
+        (massagedConfig[key] as string[]).push(mgr.replace('custom.', ''));
+      });
     } else if (is.array(val)) {
       massagedConfig[key] = [];
       val.forEach((item) => {

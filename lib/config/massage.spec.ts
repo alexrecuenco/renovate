@@ -46,6 +46,24 @@ describe('config/massage', () => {
       expect(res.packageRules).toHaveLength(3);
     });
 
+    it('massages packageRules matchManagers', () => {
+      const config: RenovateConfig = {
+        packageRules: [
+          {
+            matchManagers: ['custom.regex', 'npm'],
+            separateMajorMinor: false,
+          },
+        ],
+      };
+      const res = massage.massageConfig(config);
+      expect(res.packageRules).toEqual([
+        {
+          matchManagers: ['regex', 'npm'],
+          separateMajorMinor: false,
+        },
+      ]);
+    });
+
     it('filters packageRules with only match/exclude', () => {
       const config: RenovateConfig = {
         packageRules: [
